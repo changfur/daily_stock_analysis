@@ -200,3 +200,70 @@ def test_alphanumeric_tw_etf_and_preferred_codes_end_to_end() -> None:
     assert not etf_df.empty
     assert efinance.calls == []
     assert yfinance.calls == ["00631L.TW"]
+
+
+def test_tw_main_indices_falls_back_to_tpex_openapi_when_yahoo_twoii_missing() -> None:
+    import io
+    import json
+
+    fetcher = YfinanceFetcher()
+
+    def fake_fetch(_yf, yf_code, name, return_code):
+        if return_code == "TWII":
+            return {"code": "TWII", "name": name, "current": 23000.0}
+        return None
+
+    fetcher._fetch_yf_ticker_data = fake_fetch  # type: ignore[method-assign]
+
+    tpex_payload = json.dumps([
+        {"Date": "20261124", "Open": "276.63", "High": "293.55", "Low": "276.63", "Close": "293.23", "Change": "22.33"},
+        {"Date": "20261125", "Open": "290.72", "High": "292.22", "Low": "270.93", "Close": "275.97", "Change": "-17.26"},
+    ]).encode("utf-8")
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with patch("data_provider.yfinance_fetcher.urlopen", return_value=_FakeResp(tpex_payload)):
+        tw_indices = fetcher.get_main_indices("tw") or []
+
+    by_code = {item["code"]: item for item in tw_indices}
+    assert set(by_code) == {"TWII", "TWOII"}
+    twoii = by_code["TWOII"]
+    assert twoii["current"] == 275.97
+    assert twoii["change"] == -17.26
+    assert round(twoii["prev_close"], 2) == 293.23
+    assert round(twoii["change_pct"], 2) == round(-17.26 / 293.23 * 100.0, 2)
+
+
+def test_get_stock_name_skips_a_share_fetchers_for_tw_stocks() -> None:
+    class _NameFetcher(BaseFetcher):
+        def __init__(self, name: str, result: str = ""):
+            self.name = name
+            self.priority = 0 if name != "YfinanceFetcher" else 4
+            self.name_calls = []
+            self._result = result
+
+        def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+            raise NotImplementedError
+
+        def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+            raise NotImplementedError
+
+        def get_stock_name(self, stock_code: str):
+            self.name_calls.append(stock_code)
+            return self._result
+
+    pytdx = _NameFetcher("PytdxFetcher", "should-not-be-called")
+    baostock = _NameFetcher("BaostockFetcher", "should-not-be-called")
+    yfinance = _NameFetcher("YfinanceFetcher", "YC Inox")
+    manager = DataFetcherManager(fetchers=[pytdx, baostock, yfinance])
+
+    resolved = manager.get_stock_name("2034.TW", allow_realtime=False)
+    assert resolved == "YC Inox"
+    assert pytdx.name_calls == []
+    assert baostock.name_calls == []
+    assert yfinance.name_calls == ["2034.TW"]

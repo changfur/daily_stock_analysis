@@ -15,7 +15,9 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 """
 
 import csv
+import json
 import logging
+import math
 from datetime import datetime
 from io import StringIO
 from typing import Optional, List, Dict, Any
@@ -503,8 +505,80 @@ class YfinanceFetcher(BaseFetcher):
             logger.error(f"[Yfinance] Failed to fetch KR index quotes: {e}")
         return None
 
+    def _fetch_tpex_index_fallback(
+        self,
+        name: str = '台湾柜买指数',
+        return_code: str = 'TWOII',
+    ) -> Optional[Dict[str, Any]]:
+        """Fallback to official TPEx OpenAPI for Taiwan OTC index (TWOII) when Yahoo ^TWOII is unavailable."""
+        url = "https://www.tpex.org.tw/openapi/v1/tpex_index"
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; DSA/1.0; +https://github.com/ZhuLinsen/daily_stock_analysis)",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8", "ignore"))
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            logger.warning(f"[TPEx] Failed to fetch TW OTC index fallback: {exc}")
+            return None
+
+        if not isinstance(payload, list) or not payload:
+            return None
+
+        def _parse_num(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            text = str(val).strip().replace(",", "")
+            if not text or text in {"-", "--", "N/A"}:
+                return None
+            try:
+                num = float(text)
+            except ValueError:
+                return None
+            return num if math.isfinite(num) else None
+
+        # Records are ordered chronologically by Date (YYYYMMDD); scan from latest backwards.
+        for row in reversed(payload):
+            if not isinstance(row, dict):
+                continue
+            price = _parse_num(row.get("Close"))
+            change = _parse_num(row.get("Change"))
+            if price is None or price <= 0 or change is None:
+                continue
+            open_price = _parse_num(row.get("Open"))
+            high = _parse_num(row.get("High"))
+            low = _parse_num(row.get("Low"))
+            prev_close = price - change
+            if prev_close <= 0:
+                continue
+            high_val = high if high is not None else price
+            low_val = low if low is not None else price
+            open_val = open_price if open_price is not None else prev_close
+            change_pct = (change / prev_close) * 100.0
+            amplitude = ((high_val - low_val) / prev_close) * 100.0
+            logger.info(f"[TPEx] Fetched TW OTC index fallback succeeded: date={row.get('Date')}, close={price}")
+            return {
+                'code': return_code,
+                'name': name,
+                'current': price,
+                'change': change,
+                'change_pct': change_pct,
+                'open': open_val,
+                'high': high_val,
+                'low': low_val,
+                'prev_close': prev_close,
+                'volume': 0.0,
+                'amount': 0.0,
+                'amplitude': amplitude,
+            }
+        return None
+
     def _get_tw_main_indices(self, yf) -> Optional[List[Dict[str, Any]]]:
-        """获取台湾主要指数行情（加权指数 ^TWII、柜买指数 ^TWOII），复用 _fetch_yf_ticker_data。"""
+        """获取台湾主要指数行情（加权指数 ^TWII、柜买指数 ^TWOII + TPEx OpenAPI 兜底）。"""
         tw_indices = {
             'TWII': ('^TWII', '台湾加权指数'),
             'TWOII': ('^TWOII', '台湾柜买指数'),
@@ -512,13 +586,16 @@ class YfinanceFetcher(BaseFetcher):
         results = []
         try:
             for code, (yf_symbol, name) in tw_indices.items():
+                item = None
                 try:
                     item = self._fetch_yf_ticker_data(yf, yf_symbol, name, code)
-                    if item:
-                        results.append(item)
-                        logger.debug(f"[Yfinance] Fetched TW index {name} succeeded")
                 except Exception as e:
                     logger.warning(f"[Yfinance] Failed to fetch TW index {name}: {e}")
+                if item is None and code == 'TWOII':
+                    item = self._fetch_tpex_index_fallback(name=name, return_code=code)
+                if item:
+                    results.append(item)
+                    logger.debug(f"[Yfinance] Fetched TW index {name} succeeded")
             if results:
                 logger.info(f"[Yfinance] Fetched {len(results)} TW index quotes")
                 return results

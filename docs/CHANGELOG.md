@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [新功能] Telegram 推送消息自动通过 OpenCC `s2twp` 转换为台湾繁体中文（含台湾常用词转换并保留链接 URL；依赖不可用时 fail-open 回退原文不阻塞推送）。
 - [修复] 修正台股 `.TW` / `.TWO` 代码校验与规范化规则（覆盖后端、API、Web 前端、分享图及问股范围提取），支持 `00631L.TW`、`00632R.TW`、`00679B.TWO`、`2881A.TW`、`2887Z1.TW` 等带英文字母的台股 ETF 与特别股代码。
+- [修复] 台湾柜买指数 `TWOII` 在 Yahoo Finance `^TWOII` 缺失时自动回退至柜买中心 TPEx OpenAPI（`tpex_index`），并在 `DataFetcherManager.get_stock_name` 中为日/韩/台股跳过 A 股专属数据源，避免 Pytdx/Baostock 无效超时。
 
 - [改进] CI 瘦身：PR 仅改文档或 `tests/fixtures/**` 时以 `docs-contract-tests` 替代三分片后端全量测试；`docker-build` 保留运行时输入触发并排除前端测试与 Markdown 改动；前端仅改单元测试文件时 `web-gate` 跳过构建与 Playwright（非 PR 事件触发 `web-gate` 时仍执行完整构建与 Playwright，`docker-build` 与文档契约后端全量在非 PR 事件下保持兜底）。
 
