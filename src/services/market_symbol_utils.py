@@ -9,7 +9,15 @@ without introducing import cycles.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Optional
+
+# Taiwan TWSE (.TW) / TPEx (.TWO) security base codes:
+# - 4-6 digits: ordinary stocks (2330), standard ETFs/TDRs/ETNs (0050, 00878, 006208)
+# - 4-5 digits + 1 letter: leveraged/inverse/bond/futures/active ETFs (00631L, 00632R, 00679B, 00642U, 00980A)
+#   and preferred shares (2881A, 2882B)
+# - 4 digits + letter + digit: special preferred shares (2887Z1)
+TW_BASE_PATTERN = re.compile(r"^(?:\d{4,6}|\d{4,5}[A-Z]|\d{4}[A-Z]\d)$")
 
 
 @dataclass(frozen=True)
@@ -19,6 +27,7 @@ class SuffixMarketSpec:
     market: str
     suffixes: tuple[str, ...]
     digit_lengths: tuple[int, ...]
+    base_pattern: Optional[re.Pattern[str]] = None
 
 
 _SUFFIX_MARKET_SPECS: tuple[SuffixMarketSpec, ...] = (
@@ -26,7 +35,7 @@ _SUFFIX_MARKET_SPECS: tuple[SuffixMarketSpec, ...] = (
     SuffixMarketSpec("kr", ("KS", "KQ"), (6,)),
     # Taiwan support mirrors the same suffix-only pattern; keep it here so the
     # shared helpers stay complete for all yfinance-only offshore markets.
-    SuffixMarketSpec("tw", ("TW", "TWO"), (4, 5, 6)),
+    SuffixMarketSpec("tw", ("TW", "TWO"), (4, 5, 6), base_pattern=TW_BASE_PATTERN),
 )
 
 _MARKET_TO_SPEC = {spec.market: spec for spec in _SUFFIX_MARKET_SPECS}
@@ -59,7 +68,10 @@ def get_suffix_market(stock_code: str) -> Optional[str]:
     spec = _SUFFIX_TO_SPEC.get(suffix)
     if spec is None:
         return None
-    if not (base.isdigit() and len(base) in spec.digit_lengths):
+    if spec.base_pattern is not None:
+        if not spec.base_pattern.fullmatch(base):
+            return None
+    elif not (base.isdigit() and len(base) in spec.digit_lengths):
         return None
     return spec.market
 

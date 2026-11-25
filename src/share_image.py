@@ -44,7 +44,7 @@ _MARKET_REGION_REF_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _SUFFIXED_NUMERIC_CODE_PATTERN = (
-    r"(?:\d{6}\.(?:SH|SZ|SS|BJ|KS|KQ)|\d{1,5}\.HK|\d{4,6}\.(?:TWO|TW)|\d{4,5}\.T)"
+    r"(?:\d{6}\.(?:SH|SZ|SS|BJ|KS|KQ)|\d{1,5}\.HK|(?:\d{4,6}|\d{4,5}[A-Z]|\d{4}[A-Z]\d)\.(?:TWO|TW)|\d{4,5}\.T)"
 )
 _CODE_RE = re.compile(
     rf"(?:\(|（)?({_SUFFIXED_NUMERIC_CODE_PATTERN}|(?:(?i:sh|sz|bj|hk))?\d{{5,6}}(?:\.[A-Z]{{2}})?|(?<![A-Za-z])[A-Z]{{1,5}}(?:\.[A-Z])?(?![A-Za-z]))(?:\)|）)?",

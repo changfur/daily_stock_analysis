@@ -2187,10 +2187,10 @@ class TestTelegramSender(unittest.TestCase):
         second_payload = mock_post.call_args_list[1][1]["json"]
         self.assertEqual(first_payload["parse_mode"], "Markdown")
         self.assertNotIn("parse_mode", second_payload)
-        self.assertEqual(second_payload["text"], "*ST宝实")
+        self.assertEqual(second_payload["text"], "*ST寶實")
 
     @mock.patch("src.notification_sender.telegram_sender.requests.post")
-    def test_send_plain_text_fallback_keeps_original_text_after_legacy_markdown_error(self, mock_post):
+    def test_send_plain_text_fallback_keeps_converted_text_after_legacy_markdown_error(self, mock_post):
         markdown_error = _response(400)
         markdown_error.text = (
             '{"ok":false,"error_code":400,"description":"Bad Request: can\'t parse entities"}'
@@ -2206,8 +2206,8 @@ class TestTelegramSender(unittest.TestCase):
         self.assertTrue(result)
         first_payload = mock_post.call_args_list[0][1]["json"]
         second_payload = mock_post.call_args_list[1][1]["json"]
-        self.assertEqual(first_payload["text"], "关注 *AAPL* \\(未闭合\\)")
-        self.assertEqual(second_payload["text"], content)
+        self.assertEqual(first_payload["text"], "關注 *AAPL* \\(未閉合\\)")
+        self.assertEqual(second_payload["text"], "關注 **AAPL** (未閉合)")
 
     @mock.patch("src.notification_sender.telegram_sender.requests.post")
     def test_send_uses_legacy_telegram_report_formatter(self, mock_post):
@@ -2228,11 +2228,61 @@ class TestTelegramSender(unittest.TestCase):
         self.assertTrue(result)
         payload = mock_post.call_args.kwargs["json"]
         rendered = payload["text"]
-        self.assertIn("日报", rendered)
-        self.assertIn("📊 分析结果摘要", rendered)
-        self.assertIn("| 股票 | 信号 |", rendered)
-        self.assertIn("[详情](https://example.com/report)", rendered)
-        self.assertNotIn("# 日报", rendered)
+        self.assertIn("日報", rendered)
+        self.assertIn("📊 分析結果摘要", rendered)
+        self.assertIn("| 股票 | 訊號 |", rendered)
+        self.assertIn("強勢", rendered)
+        self.assertIn("[詳情](https://example.com/report)", rendered)
+        self.assertNotIn("# 日報", rendered)
+
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_send_converts_simplified_chinese_to_taiwan_traditional_with_s2twp_and_preserves_urls(self, mock_post):
+        mock_post.return_value = _response(200, {"ok": True})
+        cfg = _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        sender = TelegramSender(cfg)
+        content = (
+            "# 软件数据信息报告\n\n"
+            "默认支持程序项目与信号分析。\n"
+            "[查看数据详情](https://example.com/path/数据?q=软件)\n"
+            "原始链接：https://example.com/信息"
+        )
+
+        result = sender.send_to_telegram(content)
+
+        self.assertTrue(result)
+        rendered = mock_post.call_args.kwargs["json"]["text"]
+        self.assertIn("軟體資料資訊報告", rendered)
+        self.assertIn("預設支援程式專案與訊號分析。", rendered)
+        self.assertIn("[檢視資料詳情](https://example.com/path/数据?q=软件)", rendered)
+        self.assertIn("原始連結：https://example.com/信息", rendered)
+
+    @mock.patch("src.notification_sender.telegram_sender._get_s2twp_converter", return_value=None)
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_send_falls_back_to_original_text_when_opencc_unavailable(self, mock_post, _mock_converter):
+        mock_post.return_value = _response(200, {"ok": True})
+        cfg = _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        sender = TelegramSender(cfg)
+
+        result = sender.send_to_telegram("软件数据信息报告")
+
+        self.assertTrue(result)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["text"], "软件数据信息报告")
+
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_send_chunked_converts_simplified_chinese_before_measuring_utf16_length(self, mock_post):
+        mock_post.return_value = _response(200, {"ok": True})
+        cfg = _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        sender = TelegramSender(cfg)
+        # "内存" (2 chars) expands to "記憶體" (3 chars) under s2twp; 2000 copies -> 6000 UTF-16 units (> 4096)
+        content = "内存" * 2000
+
+        result = sender.send_to_telegram(content)
+
+        self.assertTrue(result)
+        self.assertGreaterEqual(mock_post.call_count, 2)
+        payload_texts = [call.kwargs["json"]["text"] for call in mock_post.call_args_list]
+        self.assertTrue(all(utf16_len(text) <= 4096 for text in payload_texts))
+        self.assertEqual("".join(payload_texts), "記憶體" * 2000)
 
     @mock.patch("src.notification_sender.telegram_sender.requests.post")
     def test_send_strips_hidden_market_region_metadata_from_text_payload(self, mock_post):

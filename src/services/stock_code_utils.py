@@ -15,6 +15,7 @@ from data_provider.base import canonical_stock_code
 from data_provider.us_index_mapping import get_us_stock_yf_symbol, is_us_stock_code, normalize_us_hyphen_symbol
 from src.services.market_symbol_utils import (
     get_suffix_market,
+    is_tw_suffix_symbol,
     normalize_suffix_market_symbol,
     suffix_base_lookup_allowed,
 )
@@ -151,6 +152,8 @@ def _is_us_index_code(code: str) -> bool:
 
 
 def _valid_exchange_code(exchange: str, base: str, digit_lens: tuple[int, ...]) -> bool:
+    if exchange in {"TW", "TWO"}:
+        return is_tw_suffix_symbol(f"{base}.{exchange}")
     if not (base.isdigit() and len(base) in digit_lens):
         return False
     if exchange in {"SH", "SS"}:

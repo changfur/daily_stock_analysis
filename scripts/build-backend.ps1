@@ -89,6 +89,7 @@ $hiddenImports = @(
   'multipart.multipart',
   'json_repair',
   'orjson',
+  'opencc',
   'tiktoken',
   'tiktoken_ext',
   'tiktoken_ext.openai_public',
@@ -145,6 +146,7 @@ $pyInstallerArgs = @(
   '--collect-data', 'tiktoken',
   '--collect-data', 'akshare',
   '--collect-data', 'fxmacrodata_public',
+  '--collect-data', 'opencc',
   '--collect-all', 'py_mini_racer',
   '--collect-all', 'src.services.screening',
   '--collect-all', 'futu'

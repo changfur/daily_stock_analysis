@@ -150,3 +150,53 @@ def test_tw_is_first_class_on_write_paths() -> None:
     assert DecisionSignalService._normalize_market("tw") == "tw"
     assert "tw" in VALID_MARKETS
     assert "tw" in _ALLOWED_MARKETS
+
+
+def test_alphanumeric_tw_etf_and_preferred_codes_end_to_end() -> None:
+    from api.v1.endpoints.stocks import _validate_stock_code
+    from src.agent.stock_scope import extract_stock_code_tokens
+    from src.services.stock_code_utils import resolve_daily_stock_identity
+    from src.services.stock_list_parser import ParseStatus, parse_analysis_target
+
+    valid_cases = [
+        ("00631L.TW", "00631L.TW", "TW"),
+        ("00631l.tw", "00631L.TW", "TW"),
+        ("00632R.TW", "00632R.TW", "TW"),
+        ("00679B.TWO", "00679B.TWO", "TWO"),
+        ("00679b.two", "00679B.TWO", "TWO"),
+        ("2881A.TW", "2881A.TW", "TW"),
+        ("2887Z1.TW", "2887Z1.TW", "TW"),
+    ]
+    fetcher = YfinanceFetcher()
+
+    for raw, canonical, exchange in valid_cases:
+        assert normalize_stock_code(raw) == canonical
+        assert detect_market(raw) == "tw"
+        assert get_market_for_stock(raw) == "tw"
+        assert is_code_like(raw) is True
+        assert normalize_code(raw) == canonical
+        assert fetcher._convert_stock_code(raw) == canonical
+        assert _validate_stock_code(raw) == raw
+
+        identity = resolve_daily_stock_identity(raw)
+        assert identity is not None
+        assert identity.normalized_code == canonical
+        assert identity.market == "tw"
+
+        target = parse_analysis_target(raw)
+        assert target.asset_type == ParseStatus.STOCK
+        assert target.canonical_id == canonical
+        assert target.exchange == exchange
+
+    assert "00631L.TW" in extract_stock_code_tokens("帮我分析 00631L.TW 和 00679B.TWO")
+    assert "00679B.TWO" in extract_stock_code_tokens("帮我分析 00631L.TW 和 00679B.TWO")
+
+    efinance = _FakeFetcher("EfinanceFetcher", should_fail=True)
+    yfinance = _FakeFetcher("YfinanceFetcher")
+    manager = DataFetcherManager(fetchers=[efinance, yfinance])
+    with patch("data_provider.base.record_provider_run_started"), patch("data_provider.base.record_provider_run"):
+        etf_df, etf_source = manager.get_daily_data("00631L.TW")
+    assert etf_source == "YfinanceFetcher"
+    assert not etf_df.empty
+    assert efinance.calls == []
+    assert yfinance.calls == ["00631L.TW"]

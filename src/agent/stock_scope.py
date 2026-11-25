@@ -240,7 +240,8 @@ def extract_stock_code_spans(text: str) -> List[tuple[int, int, str]]:
     numeric = re.compile(
         r"(?<![a-zA-Z0-9_.])(?:"
         r"(?:sh|sz|bj|csi)\d{6}|hk\d{4,5}|"
-        r"\d{1,6}\.(?:SH|SZ|SS|BJ|HK|KS|KQ|TW|T|CSI)|\d{5,6}"
+        r"(?:\d{4,6}|\d{4,5}[A-Z]|\d{4}[A-Z]\d)\.(?:TWO|TW)|"
+        r"\d{1,6}\.(?:SH|SZ|SS|BJ|HK|KS|KQ|T|CSI)|\d{5,6}"
         r")(?![a-zA-Z0-9_.])", re.IGNORECASE,
     )
     ticker = re.compile(r"(?<![a-zA-Z0-9_.])(?:us)?[A-Z]{1,5}(?:\.[A-Z]{1,2})?(?![a-zA-Z0-9_.])")

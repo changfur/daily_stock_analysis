@@ -59,6 +59,7 @@ fake-useragent>=1.4.0       # Random User-Agent support
 httpx[socks]                # HTTP client with SOCKS proxy support; optional OpenAI dependency
 dingtalk-stream >= 0.24.3    # DingTalk Stream SDK
 wecom-aibot-python-sdk >= 1.0.2    # WeCom AI Bot (smart robot) WebSocket long-connection SDK; optional at runtime (degrades gracefully when missing)
+opencc-python-reimplemented>=0.1.7  # Simplified to Taiwan Traditional Chinese (s2twp) conversion for Telegram notifications
 # Database
 # SQLite is built into Python and does not need an extra package
 

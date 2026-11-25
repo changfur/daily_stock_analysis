@@ -75,9 +75,9 @@ export function normalizeStockCode(stockCode: string): string {
     if ((suffix === 'KS' || suffix === 'KQ') && /^\d{6}$/.test(base)) {
       return `${base}.${suffix}`;
     }
-    // TW Yahoo suffix-only codes (TWSE `.TW` / TPEx `.TWO`), base 4-6 digits.
-    if ((suffix === 'TW' || suffix === 'TWO') && /^\d{4,6}$/.test(base)) {
-      return `${base}.${suffix}`;
+    // TW Yahoo suffix-only codes (TWSE `.TW` / TPEx `.TWO`), base 4-6 digits or alphanumeric ETFs/preferreds (e.g. 00631L.TW, 00679B.TWO).
+    if ((suffix === 'TW' || suffix === 'TWO') && /^(?:\d{4,6}|\d{4,5}[A-Z]|\d{4}[A-Z]\d)$/.test(base.toUpperCase())) {
+      return `${base.toUpperCase()}.${suffix}`;
     }
 
     // 00700.HK → HK00700

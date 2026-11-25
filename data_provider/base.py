@@ -148,8 +148,8 @@ def normalize_stock_code(stock_code: str) -> str:
             return f"{base}.{suffix.upper()}"
         if suffix.upper() in ('KS', 'KQ') and base.isdigit() and len(base) == 6:
             return f"{base}.{suffix.upper()}"
-        if suffix.upper() in ('TW', 'TWO') and base.isdigit() and 4 <= len(base) <= 6:
-            return f"{base}.{suffix.upper()}"
+        if suffix.upper() in ('TW', 'TWO') and is_suffix_market_symbol(f"{base}.{suffix}", "tw"):
+            return f"{base.upper()}.{suffix.upper()}"
         if suffix.upper() == 'HK' and base.isdigit() and 1 <= len(base) <= 5:
             return f"HK{base.zfill(5)}"
         if base.upper() in ('SH', 'SS', 'SZ', 'BJ') and suffix.isdigit():

@@ -7,10 +7,11 @@ Telegram 发送提醒服务
 2. 通过 Telegram Bot API 发送 图片消息
 """
 import logging
-from typing import Optional
-import requests
-import time
 import re
+import threading
+import time
+from typing import Any, Optional
+import requests
 
 from src.config import Config
 from src.formatters import (
@@ -22,6 +23,50 @@ from src.formatters import (
 
 
 logger = logging.getLogger(__name__)
+
+_OPENCC_LOCK = threading.Lock()
+_OPENCC_CONVERTER: Optional[Any] = None
+_OPENCC_INIT_ATTEMPTED = False
+_TELEGRAM_URL_RE = re.compile(
+    r"(\[[^\]]+\]\()([^)]+)(\))|(https?://[^\s)\]>]+)"
+)
+
+
+def _get_s2twp_converter() -> Optional[Any]:
+    """Return a thread-safe cached OpenCC s2twp converter, or None if unavailable."""
+    global _OPENCC_CONVERTER, _OPENCC_INIT_ATTEMPTED
+    if _OPENCC_INIT_ATTEMPTED:
+        return _OPENCC_CONVERTER
+    with _OPENCC_LOCK:
+        if _OPENCC_INIT_ATTEMPTED:
+            return _OPENCC_CONVERTER
+        _OPENCC_INIT_ATTEMPTED = True
+        try:
+            from opencc import OpenCC
+        except ImportError as exc:
+            logger.warning("OpenCC not installed; skipping Taiwan Traditional Chinese conversion: %s", exc)
+            return None
+
+        converter = None
+        last_exc: Optional[Exception] = None
+        for config_name in ("s2twp", "s2twp.json"):
+            try:
+                candidate = OpenCC(config_name)
+                # Eagerly warm up internal dictionaries inside the lock so concurrent convert() calls stay read-only.
+                candidate.convert("")
+                converter = candidate
+                break
+            except Exception as exc:  # noqa: BLE001 - fail-open to avoid blocking notifications
+                last_exc = exc
+        if converter is None:
+            logger.warning(
+                "Failed to initialize OpenCC s2twp converter; sending original Telegram content: %s",
+                last_exc,
+            )
+            return None
+
+        _OPENCC_CONVERTER = converter
+        return _OPENCC_CONVERTER
 
 
 class TelegramSender:
@@ -42,6 +87,37 @@ class TelegramSender:
     def _is_telegram_configured(self) -> bool:
         """检查 Telegram 配置是否完整"""
         return bool(self._telegram_config['bot_token'] and self._telegram_config['chat_id'])
+
+    @staticmethod
+    def _convert_to_traditional_chinese(text: str) -> str:
+        """Convert Simplified Chinese text to Taiwan Traditional Chinese (OpenCC s2twp) while preserving URLs."""
+        if not text:
+            return text
+        converter = _get_s2twp_converter()
+        if converter is None:
+            return text
+        try:
+            parts: list[str] = []
+            last_end = 0
+            for match in _TELEGRAM_URL_RE.finditer(text):
+                start, end = match.span()
+                if start > last_end:
+                    parts.append(converter.convert(text[last_end:start]))
+                if match.group(1) is not None:
+                    # Markdown link: convert [label], preserve (url)
+                    parts.append(converter.convert(match.group(1)))
+                    parts.append(match.group(2))
+                    parts.append(match.group(3))
+                else:
+                    # Bare URL: keep verbatim
+                    parts.append(match.group(4))
+                last_end = end
+            if last_end < len(text):
+                parts.append(converter.convert(text[last_end:]))
+            return "".join(parts)
+        except Exception as exc:  # noqa: BLE001 - fail-open to avoid dropping Telegram messages
+            logger.warning("OpenCC s2twp conversion failed; sending original Telegram content: %s", exc)
+            return text
 
     def send_to_telegram(
         self,
@@ -95,14 +171,15 @@ class TelegramSender:
                 logger.warning("Telegram message content is empty, skipping")
                 return False
 
-            telegram_content = self._convert_to_telegram_markdown(sanitized_content)
+            converted_content = self._convert_to_traditional_chinese(sanitized_content)
+            telegram_content = self._convert_to_telegram_markdown(converted_content)
 
             if utf16_len(telegram_content) <= max_length:
                 # 单条消息发送
                 return self._send_telegram_message(
                     api_url,
                     chat_id,
-                    sanitized_content,
+                    converted_content,
                     message_thread_id,
                     timeout_seconds=timeout_seconds,
                 )

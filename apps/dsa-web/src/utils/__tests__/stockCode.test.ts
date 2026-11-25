@@ -72,6 +72,11 @@ describe('normalizeStockCode', () => {
     expect(normalizeStockCode('2330.tw')).toBe('2330.TW');
     expect(normalizeStockCode('0050.TW')).toBe('0050.TW');
     expect(normalizeStockCode('006208.tw')).toBe('006208.TW');
+    expect(normalizeStockCode('00631l.tw')).toBe('00631L.TW');
+    expect(normalizeStockCode('00632R.TW')).toBe('00632R.TW');
+    expect(normalizeStockCode('00679b.two')).toBe('00679B.TWO');
+    expect(normalizeStockCode('2881a.tw')).toBe('2881A.TW');
+    expect(normalizeStockCode('2887z1.tw')).toBe('2887Z1.TW');
     expect(normalizeStockCode('6505.two')).toBe('6505.TWO');
     expect(normalizeStockCode('2330')).toBe('2330');
   });
