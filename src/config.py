@@ -1122,6 +1122,7 @@ class Config:
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = False  # Opt in to public discovery when base URLs are absent
     searxng_timeout_seconds: int = 10  # 自建 SearXNG 单次搜索超时（秒）
+    google_news_rss_enabled: bool = False  # Keyless Google News RSS fallback search
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1879,6 +1880,10 @@ class Config:
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
             default=False,
         )
+        google_news_rss_enabled = parse_env_bool(
+            os.getenv('GOOGLE_NEWS_RSS_ENABLED'),
+            default=False,
+        )
 
         # 企微消息类型与最大字节数逻辑
         wechat_msg_type = os.getenv('WECHAT_MSG_TYPE', 'markdown')
@@ -2059,6 +2064,7 @@ class Config:
             searxng_timeout_seconds=parse_env_int(
                 os.getenv('SEARXNG_TIMEOUT_SECONDS'), 10, field_name='SEARXNG_TIMEOUT_SECONDS', minimum=1
             ),
+            google_news_rss_enabled=google_news_rss_enabled,
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
@@ -3282,7 +3288,7 @@ class Config:
         return bool(self.searxng_base_urls) or bool(self.searxng_public_instances_enabled)
 
     def has_search_capability_enabled(self) -> bool:
-        """Whether any search provider is configured or SearXNG fallback is enabled."""
+        """Whether any search provider is configured or fallback search is enabled."""
         return bool(
             self.anspire_api_keys
             or self.bocha_api_keys
@@ -3291,6 +3297,7 @@ class Config:
             or self.brave_api_keys
             or self.serpapi_keys
             or self.has_searxng_enabled()
+            or self.google_news_rss_enabled
         )
 
     def is_agent_available(self) -> bool:

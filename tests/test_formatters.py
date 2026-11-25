@@ -450,8 +450,8 @@ class TestNotificationMarkdownFormatters(unittest.TestCase):
 
         result = format_telegram_markdown(text)
 
-        self.assertIn("*\\[P4\\] 日报*", result)
-        self.assertIn("- 600519：\\[P4\\] 强势 \\(观察\\)", result)
+        self.assertIn("*\\[P4] 日报*", result)
+        self.assertIn("- 600519：\\[P4] 强势 (观察)", result)
         self.assertIn("[详情](https://example.com/report)", result)
 
     def test_telegram_formatter_preserves_text_that_looks_like_a_link_placeholder(self):

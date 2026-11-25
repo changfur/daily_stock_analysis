@@ -267,3 +267,51 @@ def test_get_stock_name_skips_a_share_fetchers_for_tw_stocks() -> None:
     assert pytdx.name_calls == []
     assert baostock.name_calls == []
     assert yfinance.name_calls == ["2034.TW"]
+
+
+def test_yfinance_resolves_taiwan_chinese_names_from_twse_and_tpex_openapi() -> None:
+    import io
+    import json
+    import data_provider.yfinance_fetcher as yf_mod
+
+    twse_payload = json.dumps([
+        {"Code": "2330", "Name": "台積電"},
+        {"Code": "0050", "Name": "元大台灣50"},
+        {"Code": "00631L", "Name": "元大台灣50正2"},
+        {"Code": "2034", "Name": "允強"},
+    ]).encode("utf-8")
+    tpex_payload = json.dumps([
+        {"SecuritiesCompanyCode": "6488", "CompanyName": "環球晶"},
+        {"SecuritiesCompanyCode": "00679B", "CompanyName": "元大美債20年"},
+    ]).encode("utf-8")
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    calls = []
+
+    def fake_urlopen(req, timeout=10):
+        calls.append(req.full_url)
+        if "twse.com.tw" in req.full_url:
+            return _FakeResp(twse_payload)
+        return _FakeResp(tpex_payload)
+
+    fetcher = YfinanceFetcher()
+    with (
+        patch.dict(yf_mod._TW_NAME_CACHE, {}, clear=True),
+        patch.dict(yf_mod._TW_NAME_CACHE_AT, {}, clear=True),
+        patch.dict(yf_mod._TW_NAME_FAIL_AT, {}, clear=True),
+        patch("data_provider.yfinance_fetcher.urlopen", side_effect=fake_urlopen),
+    ):
+        assert fetcher.get_stock_name("2330.TW") == "台積電"
+        assert fetcher.get_stock_name("0050.TW") == "元大台灣50"
+        assert fetcher.get_stock_name("00631L.TW") == "元大台灣50正2"
+        assert fetcher.get_stock_name("2034.tw") == "允強"
+        assert fetcher.get_stock_name("6488.TWO") == "環球晶"
+        assert fetcher.get_stock_name("00679B.TWO") == "元大美債20年"
+        # Whole-market table should be cached: only 1 TWSE call + 1 TPEx call total
+        assert len(calls) == 2

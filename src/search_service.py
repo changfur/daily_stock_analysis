@@ -11,19 +11,21 @@ A股自选股智能分析系统 - 搜索服务模块
 4. 搜索结果缓存和格式化
 """
 
+import html
 import logging
 import multiprocessing
 import re
 import threading
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
-from urllib.parse import parse_qsl, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlparse
 import requests
 from newspaper import Article, Config
 from tenacity import (
@@ -2261,6 +2263,149 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class GoogleNewsRSSSearchProvider(BaseSearchProvider):
+    """Keyless Google News RSS fallback search provider (auto-detects zh-TW / en-US)."""
+
+    _RSS_URL = "https://news.google.com/rss/search"
+    _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+    _HTML_TAG_RE = re.compile(r"<[^>]+>")
+    _WHITESPACE_RE = re.compile(r"\s+")
+
+    def __init__(self, timeout_seconds: int = 10):
+        super().__init__([], "GoogleNewsRSS")
+        self._timeout_seconds = max(1, int(timeout_seconds or 10))
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        return self.search(query, max_results=max_results, days=days)
+
+    @classmethod
+    def _clean_html_text(cls, raw: str) -> str:
+        if not raw:
+            return ""
+        text = html.unescape(raw)
+        text = cls._HTML_TAG_RE.sub(" ", text)
+        return cls._WHITESPACE_RE.sub(" ", text).strip()
+
+    @classmethod
+    def _parse_pub_date(cls, raw: str) -> Optional[str]:
+        if not raw:
+            return None
+        try:
+            dt = parsedate_to_datetime(raw.strip())
+            return dt.date().isoformat()
+        except Exception:
+            return None
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        start_time = time.time()
+        clean_query = (query or "").strip()
+        if not clean_query:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="Empty search query",
+                search_time=0.0,
+            )
+
+        effective_query = clean_query
+        if days and days > 0 and "when:" not in effective_query.lower():
+            effective_query = f"{effective_query} when:{int(days)}d"
+
+        if self._CJK_RE.search(clean_query):
+            hl, gl, ceid = "zh-TW", "TW", "TW:zh-Hant"
+        else:
+            hl, gl, ceid = "en-US", "US", "US:en"
+
+        url = (
+            f"{self._RSS_URL}?q={quote(effective_query)}"
+            f"&hl={hl}&gl={gl}&ceid={ceid}"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; DSA/1.0; +https://github.com/ZhuLinsen/daily_stock_analysis)",
+            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        }
+        try:
+            response = requests.get(url, headers=headers, timeout=self._timeout_seconds)
+            elapsed = time.time() - start_time
+            if response.status_code != 200:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=f"HTTP {response.status_code}",
+                    search_time=elapsed,
+                )
+            root = ET.fromstring(response.content)
+        except Exception as exc:
+            elapsed = time.time() - start_time
+            logger.warning("[%s] Search '%s' failed: %s", self.name, clean_query, exc)
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=str(exc),
+                search_time=elapsed,
+            )
+
+        results: List[SearchResult] = []
+        for item in root.findall("./channel/item"):
+            if len(results) >= max_results:
+                break
+            raw_title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            source_el = item.find("source")
+            source_name = (source_el.text or "").strip() if source_el is not None and source_el.text else ""
+            if not source_name and " - " in raw_title:
+                title_part, tail = raw_title.rsplit(" - ", 1)
+                if title_part.strip() and tail.strip():
+                    raw_title = title_part.strip()
+                    source_name = tail.strip()
+            elif source_name and raw_title.endswith(f" - {source_name}"):
+                raw_title = raw_title[: -(len(source_name) + 3)].strip()
+
+            snippet = self._clean_html_text(item.findtext("description") or "")
+            if not snippet:
+                snippet = raw_title
+            published_date = self._parse_pub_date(item.findtext("pubDate") or "")
+            if not raw_title:
+                continue
+            results.append(
+                SearchResult(
+                    title=raw_title,
+                    snippet=snippet[:300],
+                    url=link,
+                    source=source_name or "Google News",
+                    published_date=published_date,
+                )
+            )
+
+        elapsed = time.time() - start_time
+        search_response = SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+            search_time=elapsed,
+        )
+        search_response.mark_retrieved()
+        logger.info(
+            "[%s] Search '%s' succeeded, %s results in %.2fs",
+            self.name,
+            clean_query,
+            len(results),
+            elapsed,
+        )
+        return search_response
+
+
 class SearchService:
     """
     搜索服务
@@ -2436,6 +2581,7 @@ class SearchService:
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = False,
         searxng_timeout_seconds: Optional[int] = None,
+        google_news_rss_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2451,6 +2597,7 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            google_news_rss_enabled: 是否启用免密钥 Google News RSS 兜底搜索
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2464,6 +2611,7 @@ class SearchService:
             "searxng_base_urls": list(searxng_base_urls or []),
             "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
             "searxng_timeout_seconds": searxng_timeout_seconds,
+            "google_news_rss_enabled": bool(google_news_rss_enabled),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
         }
@@ -2528,6 +2676,11 @@ class SearchService:
                 logger.info("Configured SearXNG search with %s self-hosted instance(s)", len(searxng_base_urls))
             else:
                 logger.info("Enabled SearXNG public instance auto-discovery mode")
+
+        # 8. Google News RSS（免密钥兜底新闻源，位于所有带 Key 引擎之后）
+        if google_news_rss_enabled:
+            self._providers.append(GoogleNewsRSSSearchProvider())
+            logger.info("Enabled Google News RSS keyless fallback search")
 
         if not self._providers:
             logger.warning("No search capability configured; news search will be unavailable")
@@ -5185,6 +5338,7 @@ def get_search_service() -> SearchService:
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     searxng_timeout_seconds=getattr(config, "searxng_timeout_seconds", None),
+                    google_news_rss_enabled=getattr(config, "google_news_rss_enabled", False),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

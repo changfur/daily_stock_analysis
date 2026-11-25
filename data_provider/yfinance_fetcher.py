@@ -18,6 +18,8 @@ import csv
 import json
 import logging
 import math
+import threading
+import time
 from datetime import datetime
 from io import StringIO
 from typing import Optional, List, Dict, Any
@@ -56,6 +58,17 @@ import os
 
 logger = logging.getLogger(__name__)
 
+_TW_NAME_CACHE_LOCK = threading.Lock()
+_TW_NAME_CACHE: Dict[str, Dict[str, str]] = {}
+_TW_NAME_CACHE_AT: Dict[str, float] = {}
+_TW_NAME_FAIL_AT: Dict[str, float] = {}
+_TW_NAME_CACHE_TTL_SECONDS = 21600.0
+_TW_NAME_FAIL_COOLDOWN_SECONDS = 60.0
+_TW_NAME_ENDPOINTS = {
+    "twse": ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", "Code", "Name"),
+    "tpex": ("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes", "SecuritiesCompanyCode", "CompanyName"),
+}
+
 
 class YfinanceFetcher(BaseFetcher):
     """
@@ -83,6 +96,78 @@ class YfinanceFetcher(BaseFetcher):
         pass
 
     @staticmethod
+    def _fetch_tw_chinese_name_table(market: str) -> Dict[str, str]:
+        """Fetch and cache the TWSE/TPEx whole-market Chinese security name table (fail-open)."""
+        now = time.time()
+        with _TW_NAME_CACHE_LOCK:
+            cached = _TW_NAME_CACHE.get(market)
+            if cached and (now - _TW_NAME_CACHE_AT.get(market, 0.0)) < _TW_NAME_CACHE_TTL_SECONDS:
+                return cached
+            if (now - _TW_NAME_FAIL_AT.get(market, 0.0)) < _TW_NAME_FAIL_COOLDOWN_SECONDS:
+                return cached or {}
+
+            endpoint = _TW_NAME_ENDPOINTS.get(market)
+            if not endpoint:
+                return {}
+            url, code_field, name_field = endpoint
+            request = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; DSA/1.0; +https://github.com/ZhuLinsen/daily_stock_analysis)",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with urlopen(request, timeout=10) as response:
+                    payload = json.loads(response.read().decode("utf-8", "ignore"))
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                logger.warning(f"[Yfinance] Failed to fetch TW {market} Chinese name table: {exc}")
+                _TW_NAME_FAIL_AT[market] = time.time()
+                return cached or {}
+
+            if not isinstance(payload, list):
+                _TW_NAME_FAIL_AT[market] = time.time()
+                return cached or {}
+
+            table: Dict[str, str] = {}
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                code_val = str(row.get(code_field, "")).strip().upper()
+                name_val = str(row.get(name_field, "")).strip()
+                if code_val and name_val:
+                    table[code_val] = name_val
+
+            if table:
+                _TW_NAME_CACHE[market] = table
+                _TW_NAME_CACHE_AT[market] = time.time()
+                logger.info(f"[Yfinance] Cached {len(table)} TW {market} Chinese stock names")
+                return table
+
+            _TW_NAME_FAIL_AT[market] = time.time()
+            return cached or {}
+
+    @classmethod
+    def _get_tw_chinese_name(cls, stock_code: str) -> Optional[str]:
+        """Return official Traditional Chinese name for a Taiwan .TW/.TWO stock or ETF."""
+        if not is_suffix_market_symbol(stock_code, "tw"):
+            return None
+        code = str(stock_code or "").strip().upper()
+        base, suffix = code.rsplit(".", 1)
+        market = "tpex" if suffix == "TWO" else "twse"
+        name = cls._fetch_tw_chinese_name_table(market).get(base)
+        return name if is_meaningful_stock_name(name, code) else None
+
+    def get_stock_name(self, stock_code: str) -> Optional[str]:
+        """Resolve stock display name (official Chinese name for Taiwan .TW/.TWO, static map fallback)."""
+        code = str(stock_code or "").strip().upper()
+        if self._is_tw_suffix_stock(code):
+            tw_name = self._get_tw_chinese_name(code)
+            if tw_name:
+                return tw_name
+        return STOCK_NAME_MAP.get(code)
+
+    @staticmethod
     def _is_jp_kr_suffix_stock(stock_code: str) -> bool:
         """Return True for supported JP/KR suffix-only Yahoo symbols."""
         return is_suffix_market_symbol(stock_code, "jp") or is_suffix_market_symbol(stock_code, "kr")
@@ -91,8 +176,8 @@ class YfinanceFetcher(BaseFetcher):
     def _is_tw_suffix_stock(stock_code: str) -> bool:
         """Return True for supported Taiwan suffix-only Yahoo symbols (TWSE `.TW` / TPEx `.TWO`).
 
-        Taiwan base codes are 4-6 digits (common stocks 4, ETFs/others up to 6,
-        e.g. 00878 / 006208), wider than the JP `.T` range.
+        Taiwan base codes are 4-6 digits or alphanumeric ETF/preferred codes
+        (e.g. 00878, 006208, 00631L, 00679B, 2881A), wider than the JP `.T` range.
         """
         return is_suffix_market_symbol(stock_code, "tw")
 
@@ -999,12 +1084,16 @@ class YfinanceFetcher(BaseFetcher):
                 amplitude = ((high - low) / prev_close) * 100
 
             try:
-                info_name = ticker_info.get('shortName', '') or ticker_info.get('longName', '') or ''
-                name = (
-                    info_name
-                    if is_meaningful_stock_name(info_name, symbol)
-                    else STOCK_NAME_MAP.get(quote_code, '')
-                )
+                tw_chinese_name = self._get_tw_chinese_name(quote_code) if suffix_market == "tw" else None
+                if tw_chinese_name:
+                    name = tw_chinese_name
+                else:
+                    info_name = ticker_info.get('shortName', '') or ticker_info.get('longName', '') or ''
+                    name = (
+                        info_name
+                        if is_meaningful_stock_name(info_name, symbol)
+                        else STOCK_NAME_MAP.get(quote_code, '')
+                    )
             except Exception:
                 name = STOCK_NAME_MAP.get(quote_code, '')
 

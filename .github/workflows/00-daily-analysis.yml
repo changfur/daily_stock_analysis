@@ -342,6 +342,7 @@ jobs:
           SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
           SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
           SEARXNG_TIMEOUT_SECONDS: ${{ vars.SEARXNG_TIMEOUT_SECONDS || secrets.SEARXNG_TIMEOUT_SECONDS }}
+          GOOGLE_NEWS_RSS_ENABLED: ${{ vars.GOOGLE_NEWS_RSS_ENABLED || secrets.GOOGLE_NEWS_RSS_ENABLED || 'true' }}
           MX_APIKEY: ${{ secrets.MX_APIKEY }}
           MX_PRIORITY: ${{ vars.MX_PRIORITY || secrets.MX_PRIORITY }}
           
@@ -540,6 +541,14 @@ jobs:
               ;;
             *)
               echo "  SearXNG Public Instances: ✅ 已启用"
+              ;;
+          esac
+          case "${GOOGLE_NEWS_RSS_ENABLED,,}" in
+            0|false|no|off)
+              echo "  Google News RSS (免密钥兜底): ❌ 已禁用"
+              ;;
+            *)
+              echo "  Google News RSS (免密钥兜底): ✅ 已启用"
               ;;
           esac
           echo ""

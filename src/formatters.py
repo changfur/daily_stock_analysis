@@ -874,9 +874,14 @@ def _format_telegram_markdown_unprotected(content: str) -> str:
 
 
 def escape_telegram_non_link_markdown_chars(content: str) -> str:
-    """Escape Telegram Markdown link metacharacters outside valid links."""
+    """Escape unlinked '[' in Telegram legacy Markdown while preserving valid links.
+
+    Telegram legacy Markdown (parse_mode="Markdown") only treats '_', '*', '`',
+    and '[' as escapable syntax characters; escaping '(', ')' or ']' renders
+    literal backslashes in Telegram clients (e.g. 'Apple Inc.\\(AAPL\\)').
+    """
     return re.sub(
-        r'(?P<link>\[[^\]]+\]\([^)]+\))|[\[\]()]',
+        r'(?P<link>\[[^\]]+\]\([^)]+\))|\[',
         lambda match: match.group("link") or "\\" + match.group(),
         content,
     )
