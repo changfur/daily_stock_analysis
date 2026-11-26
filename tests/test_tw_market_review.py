@@ -146,7 +146,10 @@ def test_tw_overview_uses_taipei_date_and_never_fetches_cn_stats(provider_error)
     with patch("src.market_analyzer.DataFetcherManager") as manager, patch(
         "src.market_analyzer.get_market_now",
         return_value=datetime(2026, 11, 10, 0, 30, tzinfo=ZoneInfo("Asia/Taipei")),
-    ) as market_now:
+    ) as market_now, patch(
+        "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_market_summary",
+        return_value=None,
+    ):
         if provider_error:
             manager.return_value.get_main_indices.side_effect = RuntimeError("source unavailable")
         else:
@@ -205,7 +208,10 @@ def test_tw_recap_round_trip_through_history_context_and_notification(isolated_d
             _llm_report("zh", "台股大盘复盘" if region == "tw" else "日股大盘复盘")
             for region in regions.split(",")
         ]
-    with patch("src.market_analyzer.DataFetcherManager") as manager:
+    with patch("src.market_analyzer.DataFetcherManager") as manager, patch(
+        "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_market_summary",
+        return_value=None,
+    ):
         manager.return_value.get_main_indices.side_effect = lambda region: [
             {**(_index() if region == "tw" else MarketIndex(code="N225", name="Nikkei 225", current=39000)).to_dict(),
              "prev_close": 21900 if region == "tw" else 39000}
@@ -256,3 +262,109 @@ def test_tw_markdown_only_share_image_recognizes_market_heading(heading):
     assert ("台股市场复盘" if heading == "台股大盘复盘" else heading) in html
     assert 'class="poster market' in html
     assert "TWOII: data unavailable" in html
+
+
+_TWSE_SUMMARY_FIXTURE = {
+    "date": "20261126",
+    "date_iso": "2026-11-26",
+    "up_count": 971,
+    "down_count": 83,
+    "flat_count": 32,
+    "limit_up_count": 57,
+    "limit_down_count": 3,
+    "total_turnover_twd": 845336632675,
+    "total_amount": 8453.37,
+    "institutional": {
+        "date": "20261126",
+        "date_iso": "2026-11-26",
+        "source": "TWSE-BFI82U",
+        "unit": "TWD",
+        "foreign_net_twd": -49181133625,
+        "trust_net_twd": 21213076619,
+        "dealer_net_twd": 12865149781,
+        "dealer_self_net_twd": 4003444121,
+        "dealer_hedge_net_twd": 8861705660,
+        "total_net_twd": -15102907225,
+    },
+}
+
+
+def test_tw_overview_populates_twse_breadth_turnover_and_institutional_flows():
+    with patch("src.market_analyzer.DataFetcherManager") as manager, patch(
+        "src.market_analyzer.get_market_now",
+        return_value=datetime(2026, 11, 26, 16, 10, tzinfo=ZoneInfo("Asia/Taipei")),
+    ), patch(
+        "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_market_summary",
+        return_value=_TWSE_SUMMARY_FIXTURE,
+    ):
+        manager.return_value.get_main_indices.return_value = [
+            {**_index("TWII").to_dict(), "prev_close": 21900},
+            {**_index("TWOII").to_dict(), "prev_close": 250},
+        ]
+        overview = MarketAnalyzer(region="tw", config=Config()).get_market_overview()
+
+    assert overview.up_count == 971
+    assert overview.down_count == 83
+    assert overview.flat_count == 32
+    assert overview.limit_up_count == 57
+    assert overview.limit_down_count == 3
+    assert overview.total_amount == 8453.37
+    assert overview.tw_stats_date == "2026-11-26"
+    assert overview.tw_institutional["foreign_net_twd"] == -49181133625
+    assert overview.tw_institutional["total_net_twd"] == -15102907225
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_tw_prompt_report_and_payload_include_twse_stats_and_institutional_flows(language):
+    with patch("src.market_analyzer.DataFetcherManager"):
+        analyzer = MarketAnalyzer(region="tw", config=Config(report_language=language))
+    overview = MarketOverview(
+        date="2026-11-26",
+        indices=[_index("TWII"), _index("TWOII")],
+        up_count=971,
+        down_count=83,
+        flat_count=32,
+        limit_up_count=57,
+        limit_down_count=3,
+        total_amount=8453.37,
+        tw_stats_date="2026-11-26",
+        tw_institutional=dict(_TWSE_SUMMARY_FIXTURE["institutional"]),
+    )
+    prompt = analyzer._build_review_prompt(overview, [])
+    report = analyzer.generate_market_review(overview, [])
+    payload = analyzer.build_market_review_payload(overview, [], report)
+
+    assert "两市成交额" not in prompt
+    assert "两市成交额" not in report
+    assert "北向资金" not in prompt
+    if language == "zh":
+        assert "台股集中市场概况与三大法人" in prompt
+        assert "8,453.37 亿元新台币" in prompt
+        assert "外资及陆资: -491.81 亿元" in prompt
+        assert "投信: +212.13 亿元" in prompt
+        assert "自营商: +128.65 亿元" in prompt
+        assert "三大法人合计: -151.03 亿元" in prompt
+        assert "该市场暂无涨跌家数" not in prompt
+        assert "TWSE 集中市场口径" in prompt
+        assert "三大法人（TWSE）" in report
+        assert "8,453.37 亿新台币" in report
+        assert payload["breadth"]["turnover_unit"] == "亿元新台币"
+        assert payload["breadth"]["total_amount"] == 8453.37
+    else:
+        assert "TWSE Market Breadth & Institutional Flows" in prompt
+        assert "845.34 TWD bn" in prompt
+        assert "Foreign Investors: -49.18 TWD bn" in prompt
+        assert "Investment Trust: +21.21 TWD bn" in prompt
+        assert "Dealers: +12.87 TWD bn" in prompt
+        assert "Total Three Institutional Investors: -15.10 TWD bn" in prompt
+        assert "Market breadth, aggregate turnover, participation, and fund-flow signals are not available" not in prompt
+        assert "TWSE mainboard data" in prompt
+        assert "TWSE Three Institutional Investors" in report
+        assert payload["breadth"]["turnover_unit"] == "TWD bn"
+        assert payload["breadth"]["total_amount"] == 845.34
+
+    assert payload["institutional_flows"]["foreign_net_twd"] == -49181133625
+    assert payload["breadth"]["up_count"] == 971
+    html = build_share_image_html(report, structured_payload=payload, generated_on=date(2026, 11, 26))
+    assert "971" in html
+

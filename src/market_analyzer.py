@@ -109,6 +109,10 @@ class MarketOverview:
     top_concepts: List[Dict] = field(default_factory=list)    # 涨幅前5概念
     bottom_concepts: List[Dict] = field(default_factory=list) # 跌幅前5概念
 
+    # 台股集中市场补充数据（TWSE MI_INDEX + BFI82U，可选）
+    tw_institutional: Optional[Dict[str, Any]] = None         # 三大法人买卖超汇总（单位：新台币元）
+    tw_stats_date: Optional[str] = None                       # TWSE 统计资料日期（YYYY-MM-DD）
+
 
 @dataclass
 class MarketLightReviewResult:
@@ -378,22 +382,23 @@ class MarketAnalyzer:
 
     def _get_strategy_prompt_block(self) -> str:
         if self.region == "tw" and self._get_review_language() == "en":
-            return """## Strategy Blueprint: Taiwan Index and News Recap
-Assess Taiwan market risk from available TAIEX/TPEx index data and verified news.
+            return """## Strategy Blueprint: Taiwan Market Recap
+Assess Taiwan market risk from available TAIEX/TPEx index data, TWSE mainboard breadth and institutional flows (when provided), and verified news.
 
 ### Strategy Principles
 - Check index coverage before comparing TAIEX and TPEx direction.
 - Distinguish semiconductor heavyweight signals from smaller-company themes.
-- Do not invent institutional flows, breadth, aggregate turnover, or sector rankings.
+- When TWSE breadth, total turnover, and three institutional investor flows (foreign, trust, dealers) are provided, use them to evaluate capital quality and persistence; never invent unprovided metrics such as sector rankings.
 
 ### Analysis Dimensions
 - Index Structure: assess trend and divergence only for indices with available data.
+- Flows & Breadth: when TWSE mainboard data is provided, evaluate foreign/trust/dealer alignment, listed-stock advance/decline breadth, and aggregate turnover.
 - News Catalysts: examine sourced semiconductor, export-chain, and global technology news.
 
 ### Action Framework
-- Risk-on: available indices and news align; state data limitations.
-- Neutral: indices diverge or coverage is incomplete; wait for confirmation.
-- Risk-off: indices weaken or external risk rises; prioritize drawdown control."""
+- Risk-on: available indices, institutional flows, and breadth align; state data scope boundaries.
+- Neutral: indices and institutional flows diverge or coverage is incomplete; wait for confirmation.
+- Risk-off: indices weaken, foreign outflows intensify, or external risk rises; prioritize drawdown control."""
         if self.region == "hk" and self._get_review_language() == "en":
             return """## Strategy Blueprint: Hong Kong Market Regime Strategy
 Focus on HSI trend, southbound flow dynamics, and sector rotation to define next-session risk posture.
@@ -596,9 +601,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
         overview.indices = self._get_main_indices()
 
-        # 2. 获取涨跌统计（A 股有，美股无等效数据）
+        # 2. 获取涨跌统计（A 股有；台股通过 TWSE 官方接口获取集中市场宽度、成交额与三大法人）
         if self.profile.has_market_stats:
             self._get_market_statistics(overview)
+        elif self.region == "tw":
+            self._get_tw_market_summary(overview)
 
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
@@ -684,6 +691,118 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error("[Market] %s action=get_market_stats status=failed error=%s", self._log_context(), e)
+
+    def _get_tw_market_summary(self, overview: MarketOverview) -> None:
+        """Fetch TWSE mainboard breadth, total turnover, and 三大法人 net flows (fail-open)."""
+        try:
+            logger.info("[Market] %s action=get_tw_market_summary status=start", self._log_context())
+            from data_provider.tw_institutional_fetcher import TwInstitutionalFetcher
+
+            summary = TwInstitutionalFetcher().get_market_summary()
+            if not summary:
+                logger.warning("[Market] %s action=get_tw_market_summary status=empty", self._log_context())
+                return
+
+            overview.up_count = int(summary.get("up_count") or 0)
+            overview.down_count = int(summary.get("down_count") or 0)
+            overview.flat_count = int(summary.get("flat_count") or 0)
+            overview.limit_up_count = int(summary.get("limit_up_count") or 0)
+            overview.limit_down_count = int(summary.get("limit_down_count") or 0)
+            overview.total_amount = float(summary.get("total_amount") or 0.0)
+            overview.tw_stats_date = summary.get("date_iso")
+            institutional = summary.get("institutional")
+            if isinstance(institutional, dict) and institutional.get("total_net_twd") is not None:
+                overview.tw_institutional = institutional
+
+            logger.info(
+                "[Market] %s action=get_tw_market_summary status=success data_date=%s "
+                "up=%d down=%d flat=%d limit_up=%d limit_down=%d turnover=%.2f(100M_TWD) has_inst=%s",
+                self._log_context(),
+                overview.tw_stats_date or "unknown",
+                overview.up_count,
+                overview.down_count,
+                overview.flat_count,
+                overview.limit_up_count,
+                overview.limit_down_count,
+                overview.total_amount,
+                bool(overview.tw_institutional),
+            )
+        except Exception as e:
+            logger.warning("[Market] %s action=get_tw_market_summary status=failed error=%s", self._log_context(), e)
+
+    def _has_tw_breadth_or_turnover(self, overview: MarketOverview) -> bool:
+        return bool(
+            self.region == "tw"
+            and (
+                overview.up_count
+                or overview.down_count
+                or overview.flat_count
+                or overview.limit_up_count
+                or overview.limit_down_count
+                or overview.total_amount
+            )
+        )
+
+    def _has_tw_institutional(self, overview: MarketOverview) -> bool:
+        return bool(
+            self.region == "tw"
+            and isinstance(overview.tw_institutional, dict)
+            and overview.tw_institutional.get("total_net_twd") is not None
+        )
+
+    @staticmethod
+    def _format_tw_institutional_lines(inst: Dict[str, Any], language: str) -> List[str]:
+        """Format TWSE BFI82U institutional net buy/sell breakdown for prompt or report."""
+        foreign = inst.get("foreign_net_twd")
+        trust = inst.get("trust_net_twd")
+        dealer = inst.get("dealer_net_twd")
+        dealer_self = inst.get("dealer_self_net_twd")
+        dealer_hedge = inst.get("dealer_hedge_net_twd")
+        total = inst.get("total_net_twd")
+        lines: List[str] = []
+
+        if language == "en":
+            def _fmt_bn(val: Optional[int]) -> str:
+                return f"{val / 1e9:+.2f} TWD bn"
+
+            if foreign is not None:
+                lines.append(f"  - Foreign Investors: {_fmt_bn(foreign)}")
+            if trust is not None:
+                lines.append(f"  - Investment Trust: {_fmt_bn(trust)}")
+            if dealer is not None:
+                detail = ""
+                if dealer_self is not None or dealer_hedge is not None:
+                    parts = []
+                    if dealer_self is not None:
+                        parts.append(f"Prop {dealer_self / 1e9:+.2f}")
+                    if dealer_hedge is not None:
+                        parts.append(f"Hedge {dealer_hedge / 1e9:+.2f}")
+                    detail = f" ({' / '.join(parts)})"
+                lines.append(f"  - Dealers: {_fmt_bn(dealer)}{detail}")
+            if total is not None:
+                lines.append(f"  - Total Three Institutional Investors: {_fmt_bn(total)}")
+            return lines
+
+        def _fmt_yi(val: Optional[int]) -> str:
+            return f"{val / 1e8:+.2f} 亿元"
+
+        if foreign is not None:
+            lines.append(f"  - 外资及陆资: {_fmt_yi(foreign)}")
+        if trust is not None:
+            lines.append(f"  - 投信: {_fmt_yi(trust)}")
+        if dealer is not None:
+            detail = ""
+            if dealer_self is not None or dealer_hedge is not None:
+                parts = []
+                if dealer_self is not None:
+                    parts.append(f"自行 {dealer_self / 1e8:+.2f} 亿")
+                if dealer_hedge is not None:
+                    parts.append(f"避险 {dealer_hedge / 1e8:+.2f} 亿")
+                detail = f"（{' / '.join(parts)}）"
+            lines.append(f"  - 自营商: {_fmt_yi(dealer)}{detail}")
+        if total is not None:
+            lines.append(f"  - 三大法人合计: {_fmt_yi(total)}")
+        return lines
 
     def _get_sector_rankings(self, overview: MarketOverview):
         """获取板块涨跌榜"""
@@ -1073,6 +1192,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 breadth_available = overview.up_count + overview.down_count + overview.flat_count > 0
                 limit_available = overview.limit_up_count + overview.limit_down_count > 0
                 has_breadth_data = bool(breadth_available or limit_available)
+        elif self._has_tw_breadth_or_turnover(overview):
+            has_breadth_data = True
 
         payload = {
             "version": 1,
@@ -1106,15 +1227,28 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             payload["market_light"] = light
 
         if has_breadth_data:
+            if self.region == "tw":
+                breadth_total = (
+                    round(overview.total_amount / 10.0, 2)
+                    if self._get_review_language() == "en"
+                    else round(overview.total_amount, 2)
+                )
+                breadth_unit = "TWD bn" if self._get_review_language() == "en" else "亿元新台币"
+            else:
+                breadth_total = overview.total_amount
+                breadth_unit = self._get_turnover_unit_label()
             payload["breadth"] = {
                 "up_count": overview.up_count,
                 "down_count": overview.down_count,
                 "flat_count": overview.flat_count,
                 "limit_up_count": overview.limit_up_count,
                 "limit_down_count": overview.limit_down_count,
-                "total_amount": overview.total_amount,
-                "turnover_unit": self._get_turnover_unit_label(),
+                "total_amount": breadth_total,
+                "turnover_unit": breadth_unit,
             }
+
+        if self._has_tw_institutional(overview):
+            payload["institutional_flows"] = dict(overview.tw_institutional or {})
 
         return payload
 
@@ -1246,6 +1380,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
     def _build_stats_block(self, overview: MarketOverview) -> str:
         """Build market statistics block."""
+        if self.region == "tw":
+            return self._build_tw_stats_block(overview)
         has_stats = overview.up_count or overview.down_count or overview.total_amount
         has_market_signal = bool(self._supports_market_light() and (overview.indices or has_stats))
         if not has_stats and not has_market_signal:
@@ -1298,6 +1434,93 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     f"| 两市成交额 | {overview.total_amount:.0f} 亿 | {self._describe_turnover(overview.total_amount)} |",
                 ]
             )
+        return "\n".join(lines)
+
+    def _build_tw_stats_block(self, overview: MarketOverview) -> str:
+        """Build TWSE mainboard breadth, turnover, and institutional flows block."""
+        has_breadth = bool(overview.up_count or overview.down_count or overview.flat_count)
+        has_turnover = bool(overview.total_amount)
+        has_inst = self._has_tw_institutional(overview)
+        if not has_breadth and not has_turnover and not has_inst:
+            return ""
+
+        inst = overview.tw_institutional or {}
+        data_date = overview.tw_stats_date or inst.get("date_iso") or overview.date
+        language = self._get_review_language()
+
+        if language == "en":
+            lines: List[str] = []
+            if has_breadth:
+                lines.append(
+                    f"- **TWSE Listed Breadth ({data_date})**: "
+                    f"Advancers {overview.up_count} (Limit-up {overview.limit_up_count}) / "
+                    f"Decliners {overview.down_count} (Limit-down {overview.limit_down_count}) / "
+                    f"Flat {overview.flat_count}"
+                )
+            if has_turnover:
+                lines.append(f"- **TWSE Total Turnover**: {overview.total_amount / 10.0:,.2f} TWD bn")
+            if has_inst:
+                inst_date = inst.get("date_iso") or data_date
+                lines.append(f"- **TWSE Three Institutional Investors Net Buy/Sell ({inst_date})**:")
+                lines.extend(self._format_tw_institutional_lines(inst, "en"))
+            return "\n".join(lines)
+
+        lines = []
+        if has_breadth or has_turnover:
+            lines.extend(["| 集中市场指标（TWSE） | 数值 | 观察 |", "|------|------|------|"])
+            if has_breadth:
+                participation = overview.up_count + overview.down_count
+                up_ratio = overview.up_count / participation if participation else 0.0
+                limit_spread = overview.limit_up_count - overview.limit_down_count
+                lines.append(
+                    f"| 上市股票涨跌（涨/跌/平） | {overview.up_count} / {overview.down_count} / {overview.flat_count} "
+                    f"| 上涨占比(不含平盘) {up_ratio:.1%} |"
+                )
+                lines.append(
+                    f"| 涨停/跌停 | {overview.limit_up_count} / {overview.limit_down_count} "
+                    f"| 涨跌停差 {limit_spread:+d} |"
+                )
+            if has_turnover:
+                lines.append(
+                    f"| 集中市场总成交额 | {overview.total_amount:,.2f} 亿新台币 | TWSE 资料日期 {data_date} |"
+                )
+
+        if has_inst:
+            if lines:
+                lines.append("")
+            inst_date = inst.get("date_iso") or data_date
+            foreign = inst.get("foreign_net_twd")
+            trust = inst.get("trust_net_twd")
+            dealer = inst.get("dealer_net_twd")
+            dealer_self = inst.get("dealer_self_net_twd")
+            dealer_hedge = inst.get("dealer_hedge_net_twd")
+            total = inst.get("total_net_twd")
+
+            def _dir_note(val: Optional[int]) -> str:
+                if val is None:
+                    return "-"
+                if val > 0:
+                    return "净买超"
+                if val < 0:
+                    return "净卖超"
+                return "持平"
+
+            lines.extend(["| 三大法人（TWSE） | 买卖超（亿新台币） | 备注 |", "|------|------|------|"])
+            if foreign is not None:
+                lines.append(f"| 外资及陆资 | {foreign / 1e8:+.2f} 亿 | {_dir_note(foreign)} |")
+            if trust is not None:
+                lines.append(f"| 投信 | {trust / 1e8:+.2f} 亿 | {_dir_note(trust)} |")
+            if dealer is not None:
+                detail_parts = []
+                if dealer_self is not None:
+                    detail_parts.append(f"自行 {dealer_self / 1e8:+.2f} 亿")
+                if dealer_hedge is not None:
+                    detail_parts.append(f"避险 {dealer_hedge / 1e8:+.2f} 亿")
+                dealer_note = " / ".join(detail_parts) if detail_parts else _dir_note(dealer)
+                lines.append(f"| 自营商 | {dealer / 1e8:+.2f} 亿 | {dealer_note} |")
+            if total is not None:
+                lines.append(f"| 三大法人合计 | {total / 1e8:+.2f} 亿 | TWSE 资料日期 {inst_date} |")
+
         return "\n".join(lines)
 
     @staticmethod
@@ -1632,7 +1855,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         label = str(scores["temperature_label"])
         return score, label
 
-    def _build_output_template_sections(self, review_language: str) -> str:
+    def _build_output_template_sections(self, review_language: str, *, has_tw_stats: bool = False) -> str:
         """Build LLM output sections according to market data capabilities."""
         if review_language == "en":
             if self.profile.has_market_stats and self.profile.has_sector_rankings:
@@ -1653,17 +1876,27 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
             section_number = 3
             sections: List[str] = []
-            if self.profile.has_market_stats:
+            if self.profile.has_market_stats or has_tw_stats:
+                flow_hint = (
+                    "(Interpret the provided TWSE turnover, listed-stock breadth, and three institutional investor flows—foreign, trust, and dealers—without inventing missing data.)"
+                    if has_tw_stats
+                    else "(Interpret only the provided turnover, participation, breadth, and flow signals.)"
+                )
                 sections.append(f"""### {section_number}. Fund Flows
-(Interpret only the provided turnover, participation, breadth, and flow signals.)""")
+{flow_hint}""")
                 section_number += 1
             if self.profile.has_sector_rankings:
                 sections.append(f"""### {section_number}. Sector Highlights
 (Analyze only the provided industry-sector and concept/theme rankings.)""")
                 section_number += 1
+            news_hint = (
+                "(Connect recent news to index price action, institutional flows, and macro/external-market clues. Do not infer unsupported sector-ranking data.)"
+                if has_tw_stats
+                else "(Connect recent news to index price action and macro/external-market clues. Do not infer unsupported breadth, fund-flow, or sector-ranking data.)"
+            )
             sections.extend([
                 f"""### {section_number}. News Catalysts
-(Connect recent news to index price action and macro/external-market clues. Do not infer unsupported breadth, fund-flow, or sector-ranking data.)""",
+{news_hint}""",
                 f"""### {section_number + 1}. Outlook
 (Provide the near-term outlook based on index price action and the available news.)""",
                 f"""### {section_number + 2}. Risk Alerts
@@ -1700,12 +1933,19 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         if self.profile.has_sector_rankings:
             add_section("板块主线", "（仅分析已提供的行业板块与概念题材榜单，不扩展未提供的数据）")
-        if self.profile.has_market_stats:
-            add_section("资金与情绪", "（仅解读已提供的成交额、涨跌停结构、市场宽度和风险偏好数据）")
-        add_section(
-            "消息催化",
-            "（结合近三日新闻和指数表现，提炼真正影响明日交易的催化或扰动；不要推断未提供的资金流、市场宽度或板块榜）",
+        if self.profile.has_market_stats or has_tw_stats:
+            funds_hint = (
+                "（结合已提供的 TWSE 集中市场总成交额、上市股票涨跌家数与三大法人买卖超，分析外资/投信/自营商动向与资金持续性）"
+                if has_tw_stats
+                else "（仅解读已提供的成交额、涨跌停结构、市场宽度和风险偏好数据）"
+            )
+            add_section("资金与情绪", funds_hint)
+        news_hint = (
+            "（结合近三日新闻、指数表现与法人资金流向，提炼真正影响明日交易的催化或扰动；不要推断未提供的板块榜数据）"
+            if has_tw_stats
+            else "（结合近三日新闻和指数表现，提炼真正影响明日交易的催化或扰动；不要推断未提供的资金流、市场宽度或板块榜）"
         )
+        add_section("消息催化", news_hint)
         add_section("明日交易计划", "（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件）")
         add_section("风险提示", "（列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）")
         return "\n\n".join(sections)
@@ -1743,16 +1983,44 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             url_line = f"\n   URL: {url}" if url else ""
             news_text += f"{i}. {title}{meta}\n   {snippet or '-'}{url_line}\n"
         
-        # 按 region 组装市场概况与板块区块（美股/港股/日韩无涨跌家数、板块数据）
+        # 按 region 组装市场概况与板块区块（美股/港股/日韩无涨跌家数、板块数据；台股可选注入 TWSE 集中市场与三大法人）
         stats_block = ""
         sector_block = ""
         data_limits_block = ""
+        has_tw_breadth = bool(
+            self.region == "tw"
+            and (overview.up_count or overview.down_count or overview.flat_count)
+        )
+        has_tw_turnover = bool(self.region == "tw" and overview.total_amount)
+        has_tw_breadth_or_turnover = has_tw_breadth or has_tw_turnover
+        has_tw_inst = self._has_tw_institutional(overview)
+        has_tw_any_stats = has_tw_breadth_or_turnover or has_tw_inst
+        tw_data_date = overview.tw_stats_date or (overview.tw_institutional or {}).get("date_iso") or overview.date
+
         if review_language == "en":
             if self.profile.has_market_stats:
                 stats_block = f"""## Market Breadth
 - Advancers: {overview.up_count} | Decliners: {overview.down_count} | Flat: {overview.flat_count}
 - Limit-up: {overview.limit_up_count} | Limit-down: {overview.limit_down_count}
 - Turnover: {overview.total_amount:.0f} ({self._get_turnover_unit_label()})"""
+            elif has_tw_any_stats:
+                tw_lines: List[str] = []
+                if has_tw_breadth:
+                    tw_lines.append(
+                        f"- Listed Stocks Breadth: Advancers {overview.up_count} (Limit-up {overview.limit_up_count}) | "
+                        f"Decliners {overview.down_count} (Limit-down {overview.limit_down_count}) | Flat {overview.flat_count}"
+                    )
+                if has_tw_turnover:
+                    tw_lines.append(f"- TWSE Total Turnover: {overview.total_amount / 10.0:,.2f} TWD bn")
+                if has_tw_inst:
+                    inst = overview.tw_institutional or {}
+                    inst_date = inst.get("date_iso") or tw_data_date
+                    tw_lines.append(f"- Three Institutional Investors Net Buy/Sell (TWSE, Data Date: {inst_date}):")
+                    tw_lines.extend(self._format_tw_institutional_lines(inst, "en"))
+                stats_block = (
+                    f"## TWSE Market Breadth & Institutional Flows (Data Date: {tw_data_date})\n"
+                    + "\n".join(tw_lines)
+                )
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## Sector / Theme Performance
@@ -1763,9 +2031,23 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
             data_limit_lines = self._tw_index_coverage_lines(overview)
             if not self.profile.has_market_stats:
-                data_limit_lines.append(
-                    "- Market breadth, aggregate turnover, participation, and fund-flow signals are not available for this market."
-                )
+                if has_tw_any_stats:
+                    if has_tw_breadth_or_turnover and has_tw_inst:
+                        data_limit_lines.append(
+                            "- Market breadth, aggregate turnover, and institutional flows reflect TWSE mainboard data (excluding TPEx OTC aggregates)."
+                        )
+                    elif has_tw_breadth_or_turnover:
+                        data_limit_lines.append(
+                            "- Breadth/turnover reflect TWSE mainboard data; three institutional investor flows are unavailable."
+                        )
+                    else:
+                        data_limit_lines.append(
+                            "- Institutional flows reflect TWSE mainboard data; market breadth and aggregate turnover are unavailable."
+                        )
+                else:
+                    data_limit_lines.append(
+                        "- Market breadth, aggregate turnover, participation, and fund-flow signals are not available for this market."
+                    )
             if not self.profile.has_sector_rankings:
                 data_limit_lines.append("- Sector/theme ranking data is not available for this market.")
             if data_limit_lines:
@@ -1776,6 +2058,24 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 - 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元"""
+            elif has_tw_any_stats:
+                tw_lines = []
+                if has_tw_breadth:
+                    tw_lines.append(
+                        f"- 上市股票涨跌: 上涨 {overview.up_count} 家（涨停 {overview.limit_up_count} 家） | "
+                        f"下跌 {overview.down_count} 家（跌停 {overview.limit_down_count} 家） | 持平 {overview.flat_count} 家"
+                    )
+                if has_tw_turnover:
+                    tw_lines.append(f"- 集中市场总成交额: {overview.total_amount:,.2f} 亿元新台币")
+                if has_tw_inst:
+                    inst = overview.tw_institutional or {}
+                    inst_date = inst.get("date_iso") or tw_data_date
+                    tw_lines.append(f"- 三大法人买卖超（TWSE 集中市场，资料日期 {inst_date}，单位：亿元新台币）:")
+                    tw_lines.extend(self._format_tw_institutional_lines(inst, "zh"))
+                stats_block = (
+                    f"## 台股集中市场概况与三大法人（TWSE，资料日期 {tw_data_date}）\n"
+                    + "\n".join(tw_lines)
+                )
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## 板块表现
@@ -1786,7 +2086,21 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
             data_limit_lines = self._tw_index_coverage_lines(overview)
             if not self.profile.has_market_stats:
-                data_limit_lines.append("- 该市场暂无涨跌家数、涨跌停、成交额汇总、参与度或资金流信号。")
+                if has_tw_any_stats:
+                    if has_tw_breadth_or_turnover and has_tw_inst:
+                        data_limit_lines.append(
+                            "- 涨跌家数、总成交额与三大法人买卖超为 TWSE 集中市场口径（不含 TPEx 柜买市场个股汇总）。"
+                        )
+                    elif has_tw_breadth_or_turnover:
+                        data_limit_lines.append(
+                            "- 涨跌家数与总成交额为 TWSE 集中市场口径；三大法人买卖超暂缺，请勿臆造。"
+                        )
+                    else:
+                        data_limit_lines.append(
+                            "- 三大法人买卖超为 TWSE 集中市场口径；市场涨跌家数与总成交额暂缺，请勿臆造。"
+                        )
+                else:
+                    data_limit_lines.append("- 该市场暂无涨跌家数、涨跌停、成交额汇总、参与度或资金流信号。")
             if not self.profile.has_sector_rankings:
                 data_limit_lines.append("- 该市场暂无行业板块/概念题材涨跌榜。")
             if data_limit_lines:
@@ -1810,11 +2124,15 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 if data_limits_block
                 else ""
             )
-            market_summary_hint = (
-                "2-3 sentences summarizing overall market tone, index moves, and liquidity."
-                if self.profile.has_market_stats
-                else "2-3 sentences summarizing overall market tone, index moves, and available news context."
-            )
+            if self.profile.has_market_stats:
+                market_summary_hint = "2-3 sentences summarizing overall market tone, index moves, and liquidity."
+            elif has_tw_any_stats:
+                market_summary_hint = (
+                    "2-3 sentences summarizing overall market tone, index moves, TWSE breadth/turnover, "
+                    "and three institutional investor flows (foreign, trust, dealers)."
+                )
+            else:
+                market_summary_hint = "2-3 sentences summarizing overall market tone, index moves, and available news context."
         else:
             indices_placeholder = indices_text if indices_text else "暂无指数数据（接口异常）"
             news_placeholder = news_text if news_text else "暂无相关新闻"
@@ -1823,20 +2141,27 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 if data_limits_block
                 else ""
             )
-            market_summary_hint = (
-                "2-3句话概括指数、涨跌家数、成交额和情绪温度，明确“强势/偏暖/震荡/偏弱”判断"
-                if self.profile.has_market_stats
-                else "2-3句话概括指数表现、新闻线索和整体风险状态，不要补写未提供的市场宽度或资金流数据"
-            )
+            if self.profile.has_market_stats:
+                market_summary_hint = "2-3句话概括指数、涨跌家数、成交额和情绪温度，明确“强势/偏暖/震荡/偏弱”判断"
+            elif has_tw_any_stats:
+                market_summary_hint = (
+                    "2-3句话概括加权/柜买指数、TWSE 集中市场涨跌家数、总成交额与三大法人买卖超，"
+                    "明确“强势/偏暖/震荡/偏弱”判断"
+                )
+            else:
+                market_summary_hint = "2-3句话概括指数表现、新闻线索和整体风险状态，不要补写未提供的市场宽度或资金流数据"
 
-        output_template_sections = self._build_output_template_sections(review_language)
+        output_template_sections = self._build_output_template_sections(
+            review_language,
+            has_tw_stats=has_tw_any_stats,
+        )
         zh_market_scope_name = self._get_market_scope_name("zh")
         zh_report_title = f"{overview.date} 大盘复盘"
         if self.region in ("jp", "kr", "tw"):
             zh_report_title = f"{overview.date} {zh_market_scope_name}大盘复盘"
         workflow_hint = (
             "报告要像交易员盘后工作台：先给结论，再按数据表、主线、催化、计划展开"
-            if self.profile.has_market_stats or self.profile.has_sector_rankings
+            if self.profile.has_market_stats or self.profile.has_sector_rankings or has_tw_any_stats
             else "报告要像交易员盘后工作台：先给结论，再按指数、新闻催化和计划展开"
         )
 
@@ -1992,9 +2317,11 @@ Output the report content directly, no extra commentary.
         top_concept_text = separator.join([s['name'] for s in overview.top_concepts[:3]])
         bottom_concept_text = separator.join([s['name'] for s in overview.bottom_concepts[:3]])
 
+        has_tw_stats = self._has_tw_breadth_or_turnover(overview) or self._has_tw_institutional(overview)
+
         if template_language == "en":
             stats_section = ""
-            if self._supports_market_light() or self.profile.has_market_stats:
+            if self._supports_market_light() or self.profile.has_market_stats or has_tw_stats:
                 stats_block = self._build_stats_block(overview)
                 if stats_block:
                     stats_section = f"""
@@ -2041,7 +2368,7 @@ Market conditions can change quickly. The data above is for reference only and d
         market_label = market_labels.get(self.region, "A股")
         dashboard_block = (
             self._build_stats_block(overview)
-            if self._supports_market_light() or self.profile.has_market_stats
+            if self._supports_market_light() or self.profile.has_market_stats or has_tw_stats
             else ""
         )
         indices_block = self._build_indices_block(overview)
@@ -2049,7 +2376,11 @@ Market conditions can change quickly. The data above is for reference only and d
         summary_focus = (
             "指数承接、成交额变化和板块持续性"
             if self.profile.has_market_stats and self.profile.has_sector_rankings
-            else "指数承接、消息催化和整体风险状态"
+            else (
+                "指数承接、三大法人流向与集中市场广度"
+                if has_tw_stats
+                else "指数承接、消息催化和整体风险状态"
+            )
         )
         market_summary_block = (
             dashboard_block

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 台股大盘复盘接入 TWSE 官方免密钥 RWD 开放资料（`MI_INDEX?type=MS` 与 `BFI82U`），补充上市股票涨跌/涨跌停/持平家数、集中市场总成交额与三大法人（外资、投信、自营商含自行与避险、合计）买卖超金额并注入 Prompt、报告表格及结构化 payload（双端点独立 fail-open）。
+- [修复] 在 `src/core/config_registry.py` 补齐 `GOOGLE_NEWS_RSS_ENABLED` 配置项注册与帮助元数据，确保与 `.env.example` 和设置 Schema 契约一致。
 - [新功能] Telegram 推送消息自动通过 OpenCC `s2twp` 转换为台湾繁体中文（含台湾常用词转换并保留链接 URL；依赖不可用时 fail-open 回退原文不阻塞推送）。
 - [修复] 修正台股 `.TW` / `.TWO` 代码校验与规范化规则（覆盖后端、API、Web 前端、分享图及问股范围提取），支持 `00631L.TW`、`00632R.TW`、`00679B.TWO`、`2881A.TW`、`2887Z1.TW` 等带英文字母的台股 ETF 与特别股代码。
 - [修复] 台湾柜买指数 `TWOII` 在 Yahoo Finance `^TWOII` 缺失时自动回退至柜买中心 TPEx OpenAPI（`tpex_index`），并在 `DataFetcherManager.get_stock_name` 中为日/韩/台股跳过 A 股专属数据源，避免 Pytdx/Baostock 无效超时。

@@ -372,5 +372,114 @@ class TestCircuitBreakerAndDateGuard(unittest.TestCase):
         self.assertIsNotNone(rec)
 
 
+MI_INDEX_FIXTURE = {
+    "stat": "OK",
+    "date": "20261126",
+    "tables": [
+        {
+            "title": "115年11月26日 大盤統計資訊",
+            "fields": ["成交統計", "成交金額(元)", "成交股數(股)", "成交筆數"],
+            "data": [
+                ["1.一般股票", "760,000,000,000", "9,000,000,000", "3,000,000"],
+                ["總計(1~15)", "845,336,632,675", "11,760,283,963", "3,717,271"],
+            ],
+        },
+        {
+            "title": "漲跌證券數合計",
+            "fields": ["類型", "整體市場", "股票"],
+            "data": [
+                ["上漲(漲停)", "7,814(262)", "971(57)"],
+                ["下跌(跌停)", "1,871(99)", "83(3)"],
+                ["持平", "413", "32"],
+            ],
+        },
+    ],
+}
+
+BFI82U_FIXTURE = {
+    "stat": "OK",
+    "date": "20261126",
+    "fields": ["單位名稱", "買進金額", "賣出金額", "買賣差額"],
+    "data": [
+        ["自營商(自行買賣)", "20,000,000,000", "15,996,555,879", "4,003,444,121"],
+        ["自營商(避險)", "25,000,000,000", "16,138,294,340", "8,861,705,660"],
+        ["投信", "35,000,000,000", "13,786,923,381", "21,213,076,619"],
+        ["外資及陸資(不含外資自營商)", "100,000,000,000", "149,181,133,625", "-49,181,133,625"],
+        ["外資自營商", "0", "0", "0"],
+        ["合計", "180,000,000,000", "195,102,907,225", "-15,102,907,225"],
+    ],
+}
+
+
+class TestTwMarketSummary(unittest.TestCase):
+    """Offline tests for TWSE market-wide breadth, turnover, and institutional flows."""
+
+    def test_get_market_summary_parses_mi_index_and_bfi82u_and_caches(self):
+        def _fake_get(url, **_kwargs):
+            if "MI_INDEX" in url:
+                return _resp(MI_INDEX_FIXTURE)
+            if "BFI82U" in url:
+                return _resp(BFI82U_FIXTURE)
+            raise AssertionError(f"Unexpected url: {url}")
+
+        f = _fetcher()
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_fake_get) as mock_get:
+            summary = f.get_market_summary()
+            cached = f.get_market_summary()
+
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(summary, cached)
+        self.assertEqual(summary["date"], "20261126")
+        self.assertEqual(summary["date_iso"], "2026-11-26")
+        self.assertEqual(summary["up_count"], 971)
+        self.assertEqual(summary["down_count"], 83)
+        self.assertEqual(summary["flat_count"], 32)
+        self.assertEqual(summary["limit_up_count"], 57)
+        self.assertEqual(summary["limit_down_count"], 3)
+        self.assertEqual(summary["total_turnover_twd"], 845336632675)
+        self.assertEqual(summary["total_amount"], 8453.37)
+
+        inst = summary["institutional"]
+        self.assertEqual(inst["source"], "TWSE-BFI82U")
+        self.assertEqual(inst["foreign_net_twd"], -49181133625)
+        self.assertEqual(inst["trust_net_twd"], 21213076619)
+        self.assertEqual(inst["dealer_self_net_twd"], 4003444121)
+        self.assertEqual(inst["dealer_hedge_net_twd"], 8861705660)
+        self.assertEqual(inst["dealer_net_twd"], 12865149781)
+        self.assertEqual(inst["total_net_twd"], -15102907225)
+
+    def test_partial_failure_still_returns_available_endpoint_data(self):
+        import requests as _rq
+
+        def _fake_get(url, **_kwargs):
+            if "MI_INDEX" in url:
+                return _resp(MI_INDEX_FIXTURE)
+            raise _rq.ConnectionError("bfi82u down")
+
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_fake_get):
+            summary = _fetcher().get_market_summary()
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["up_count"], 971)
+        self.assertEqual(summary["total_amount"], 8453.37)
+        self.assertIsNone(summary["institutional"])
+
+    def test_both_endpoints_malformed_or_failed_fail_open_none(self):
+        with patch(
+            "data_provider.tw_institutional_fetcher.requests.get",
+            return_value=_resp({"stat": "ERROR", "data": []}),
+        ):
+            self.assertIsNone(_fetcher().get_market_summary())
+
+    def test_explicit_date_mismatch_fails_open(self):
+        def _fake_get(url, **_kwargs):
+            if "MI_INDEX" in url:
+                return _resp(MI_INDEX_FIXTURE)
+            return _resp(BFI82U_FIXTURE)
+
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_fake_get):
+            self.assertIsNone(_fetcher().get_market_summary(date="20260101"))
+
+
 if __name__ == "__main__":
     unittest.main()

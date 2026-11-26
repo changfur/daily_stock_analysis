@@ -26,9 +26,10 @@ Units are **shares (股)**, not lots (張). Buy/sell-net signs are preserved
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 _T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
 _TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
+_BFI82U_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
+_MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+_COUNT_WITH_LIMIT_RE = re.compile(r"^\s*([\d,]+)\s*(?:\(\s*([\d,]+)\s*\))?\s*$")
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -97,6 +101,23 @@ def minguo_to_ad(date_str: Any) -> Optional[str]:
     if not (text.isdigit() and len(text) == 7):
         return None
     return f"{int(text[:3]) + 1911}{text[3:]}"
+
+
+def _parse_count_with_limit(value: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Parse TWSE MI_INDEX breadth cell like ``'971(57)'`` or ``'32'``."""
+    match = _COUNT_WITH_LIMIT_RE.match(str(value or ""))
+    if not match:
+        return None, None
+    total = _to_int(match.group(1))
+    limit = _to_int(match.group(2)) if match.group(2) is not None else None
+    return total, limit
+
+
+def _format_ad_date_iso(ad_date: Optional[str]) -> Optional[str]:
+    """Format an 8-digit ``YYYYMMDD`` date string as ``YYYY-MM-DD``."""
+    if not ad_date or len(ad_date) != 8 or not ad_date.isdigit():
+        return None
+    return f"{ad_date[:4]}-{ad_date[4:6]}-{ad_date[6:8]}"
 
 
 class TwInstitutionalFetcher:
@@ -396,3 +417,241 @@ class TwInstitutionalFetcher:
             # Official total when present; otherwise the component sum (kept consistent).
             "total_net": total if total is not None else foreign + trust + dealer,
         }
+
+    # ---------------------------------------- TWSE market-wide summary (大盤)
+    def get_market_summary(self, date: Optional[str] = None) -> Optional[dict]:
+        """Fetch TWSE mainboard breadth, total turnover, and 三大法人 net buy/sell.
+
+        Combines two keyless official TWSE RWD endpoints:
+          - ``MI_INDEX?response=json&type=MS``: listed stock advance/decline/limit
+            counts and mainboard total turnover (TWD).
+          - ``BFI82U?response=json``: foreign, trust, dealer (prop/hedge), and
+            total institutional net buy/sell amounts (TWD).
+
+        Fail-open: each endpoint fails independently; returns ``None`` only when
+        neither endpoint produces usable data. Never raises into the caller.
+        """
+        ad_date = self._norm_ad_date(date)
+        key = ("twse_market_summary", ad_date)
+        cached = self._read_cache(key)
+        if cached is not None:
+            return cached
+
+        with self._key_lock(key):
+            cached = self._read_cache(key)
+            if cached is not None:
+                return cached
+
+            mi_data: Optional[dict] = None
+            bfi_data: Optional[dict] = None
+
+            if self._breaker.is_available("twse_mi_index"):
+                try:
+                    mi_data = self._fetch_twse_mi_index_summary(ad_date)
+                    self._breaker.record_success("twse_mi_index")
+                except Exception as exc:  # noqa: BLE001 - fail-open by contract
+                    self._breaker.record_failure("twse_mi_index", str(exc))
+                    logger.info("[tw-market] TWSE MI_INDEX fetch failed: %s", exc)
+            else:
+                logger.info("[tw-market] twse_mi_index circuit OPEN -> skip fetch")
+
+            if self._breaker.is_available("twse_bfi82u"):
+                try:
+                    bfi_data = self._fetch_twse_bfi82u(ad_date)
+                    self._breaker.record_success("twse_bfi82u")
+                except Exception as exc:  # noqa: BLE001 - fail-open by contract
+                    self._breaker.record_failure("twse_bfi82u", str(exc))
+                    logger.info("[tw-market] TWSE BFI82U fetch failed: %s", exc)
+            else:
+                logger.info("[tw-market] twse_bfi82u circuit OPEN -> skip fetch")
+
+            if not mi_data and not bfi_data:
+                return None
+
+            summary_date = (
+                (mi_data or {}).get("date")
+                or (bfi_data or {}).get("date")
+                or ad_date
+            )
+            summary: Dict[str, Any] = {
+                "date": summary_date,
+                "date_iso": _format_ad_date_iso(summary_date),
+                "up_count": (mi_data or {}).get("up_count", 0),
+                "down_count": (mi_data or {}).get("down_count", 0),
+                "flat_count": (mi_data or {}).get("flat_count", 0),
+                "limit_up_count": (mi_data or {}).get("limit_up_count", 0),
+                "limit_down_count": (mi_data or {}).get("limit_down_count", 0),
+                "total_turnover_twd": (mi_data or {}).get("total_turnover_twd"),
+                "total_amount": (mi_data or {}).get("total_amount", 0.0),
+                "institutional": bfi_data,
+            }
+
+            with self._lock:
+                self._cache[key] = summary
+                self._cache_at[key] = time.time()
+            return summary
+
+    def _fetch_twse_mi_index_summary(self, ad_date: Optional[str]) -> Optional[dict]:
+        """Parse TWSE MI_INDEX (type=MS) for total turnover and listed-stock breadth."""
+        params: Dict[str, str] = {"response": "json", "type": "MS"}
+        if ad_date:
+            params["date"] = ad_date
+        payload = self._get_json(_MI_INDEX_URL, params)
+        if not isinstance(payload, dict) or payload.get("stat") != "OK":
+            return None
+        payload_date = self._norm_ad_date(payload.get("date"))
+        if ad_date and payload_date and payload_date != ad_date:
+            logger.info(
+                "[tw-market] TWSE MI_INDEX requested date %s != served %s -> fail-open",
+                ad_date,
+                payload_date,
+            )
+            return None
+
+        tables = payload.get("tables")
+        if not isinstance(tables, list):
+            return None
+
+        result: Dict[str, Any] = {
+            "date": payload_date or ad_date,
+            "date_iso": _format_ad_date_iso(payload_date or ad_date),
+            "source": "TWSE-MI_INDEX",
+        }
+        parsed_any = False
+
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            fields = table.get("fields")
+            rows = table.get("data")
+            if not isinstance(fields, list) or not isinstance(rows, list):
+                continue
+
+            # 1) Mainboard total turnover table ("大盤統計資訊")
+            if "成交統計" in fields and "成交金額(元)" in fields:
+                stat_idx = fields.index("成交統計")
+                amt_idx = fields.index("成交金額(元)")
+                for row in rows:
+                    if not isinstance(row, (list, tuple)) or max(stat_idx, amt_idx) >= len(row):
+                        continue
+                    label = str(row[stat_idx] or "").strip()
+                    if label.startswith("總計"):
+                        turnover_twd = _to_int(row[amt_idx])
+                        if turnover_twd is not None and turnover_twd > 0:
+                            result["total_turnover_twd"] = turnover_twd
+                            result["total_amount"] = round(turnover_twd / 1e8, 2)
+                            parsed_any = True
+                        break
+
+            # 2) Listed stock breadth table ("漲跌證券數合計")
+            if "類型" in fields and "股票" in fields:
+                type_idx = fields.index("類型")
+                stock_idx = fields.index("股票")
+                up_count = down_count = flat_count = None
+                limit_up = limit_down = 0
+                for row in rows:
+                    if not isinstance(row, (list, tuple)) or max(type_idx, stock_idx) >= len(row):
+                        continue
+                    label = str(row[type_idx] or "").strip()
+                    cell = row[stock_idx]
+                    if label.startswith("上漲"):
+                        cnt, lim = _parse_count_with_limit(cell)
+                        if cnt is not None:
+                            up_count = cnt
+                            limit_up = lim or 0
+                    elif label.startswith("下跌"):
+                        cnt, lim = _parse_count_with_limit(cell)
+                        if cnt is not None:
+                            down_count = cnt
+                            limit_down = lim or 0
+                    elif label.startswith("持平"):
+                        cnt, _ = _parse_count_with_limit(cell)
+                        if cnt is not None:
+                            flat_count = cnt
+
+                if up_count is not None and down_count is not None:
+                    result["up_count"] = up_count
+                    result["down_count"] = down_count
+                    result["flat_count"] = flat_count or 0
+                    result["limit_up_count"] = limit_up
+                    result["limit_down_count"] = limit_down
+                    parsed_any = True
+
+        return result if parsed_any else None
+
+    def _fetch_twse_bfi82u(self, ad_date: Optional[str]) -> Optional[dict]:
+        """Parse TWSE BFI82U for market-wide 三大法人 net buy/sell amounts (TWD)."""
+        params: Dict[str, str] = {"response": "json"}
+        if ad_date:
+            params["date"] = ad_date
+        payload = self._get_json(_BFI82U_URL, params)
+        if not isinstance(payload, dict) or payload.get("stat") != "OK":
+            return None
+        payload_date = self._norm_ad_date(payload.get("date"))
+        if ad_date and payload_date and payload_date != ad_date:
+            logger.info(
+                "[tw-market] TWSE BFI82U requested date %s != served %s -> fail-open",
+                ad_date,
+                payload_date,
+            )
+            return None
+
+        fields = payload.get("fields")
+        rows = payload.get("data")
+        if not isinstance(fields, list) or not isinstance(rows, list) or not rows:
+            return None
+        if "單位名稱" not in fields or "買賣差額" not in fields:
+            logger.info("[tw-market] TWSE BFI82U fields header missing/renamed -> fail-open")
+            return None
+
+        name_idx = fields.index("單位名稱")
+        diff_idx = fields.index("買賣差額")
+
+        foreign_excl: Optional[int] = None
+        foreign_dealer: int = 0
+        trust: Optional[int] = None
+        dealer_self: Optional[int] = None
+        dealer_hedge: Optional[int] = None
+        total: Optional[int] = None
+
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or max(name_idx, diff_idx) >= len(row):
+                continue
+            unit_name = str(row[name_idx] or "").strip()
+            net_val = _to_int(row[diff_idx])
+            if net_val is None:
+                continue
+            if unit_name == "投信":
+                trust = net_val
+            elif unit_name.startswith("外資及陸資"):
+                foreign_excl = net_val
+            elif unit_name == "外資自營商":
+                foreign_dealer = net_val
+            elif unit_name == "自營商(自行買賣)":
+                dealer_self = net_val
+            elif unit_name == "自營商(避險)":
+                dealer_hedge = net_val
+            elif unit_name == "合計":
+                total = net_val
+
+        if foreign_excl is None or trust is None or (dealer_self is None and dealer_hedge is None):
+            return None
+
+        foreign_net = foreign_excl + foreign_dealer
+        dealer_net = (dealer_self or 0) + (dealer_hedge or 0)
+        resolved_total = total if total is not None else (foreign_net + trust + dealer_net)
+        resolved_date = payload_date or ad_date
+
+        return {
+            "date": resolved_date,
+            "date_iso": _format_ad_date_iso(resolved_date),
+            "source": "TWSE-BFI82U",
+            "unit": "TWD",
+            "foreign_net_twd": foreign_net,
+            "trust_net_twd": trust,
+            "dealer_net_twd": dealer_net,
+            "dealer_self_net_twd": dealer_self,
+            "dealer_hedge_net_twd": dealer_hedge,
+            "total_net_twd": resolved_total,
+        }
+
