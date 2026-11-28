@@ -44,6 +44,8 @@ _BFI82U_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
 _MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 _MI_MARGN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
 _TPEX_MARGIN_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"
+_TWSE_MONTHLY_REV_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+_TPEX_MONTHLY_REV_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
 _COUNT_WITH_LIMIT_RE = re.compile(r"^\s*([\d,]+)\s*(?:\(\s*([\d,]+)\s*\))?\s*$")
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1084,6 +1086,119 @@ class TwInstitutionalFetcher:
             "margin": self._compute_series_trend([int(r["margin_change"]) for r in records]),
             "short": self._compute_series_trend([int(r["short_change"]) for r in records]),
         }
+
+    # ---------------------------------------- TW official monthly revenue (月營收)
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            text = str(value).replace(",", "").replace(" ", "").strip()
+        except (TypeError, ValueError):
+            return None
+        if text in ("", "-", "--", "—", "N/A", "nan", "NaN"):
+            return None
+        try:
+            num = float(text)
+            if num != num:  # NaN guard
+                return None
+            return num
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _minguo_ym_to_ad(ym: Any) -> Optional[str]:
+        """Convert ROC year-month ``YYYMM`` (e.g. ``11510``) to ``YYYY-MM`` (``2026-10``)."""
+        text = str(ym or "").strip()
+        if not (text.isdigit() and len(text) in (5, 6)):
+            return None
+        year = int(text[:-2]) + 1911
+        month = int(text[-2:])
+        if not (1 <= month <= 12):
+            return None
+        return f"{year:04d}-{month:02d}"
+
+    def get_monthly_revenue(self, stock_code: str) -> Optional[dict]:
+        """Return latest official Taiwan monthly revenue (unit: thousand TWD / 億元) for ``.TW`` / ``.TWO``.
+
+        Sources (keyless OpenAPI, whole-market table cached per market):
+          - TWSE: ``t187ap05_L`` (listed)
+          - TPEx: ``mopsfin_t187ap05_O`` (OTC)
+        ETFs and non-TW tickers return ``None`` cleanly. Strictly fail-open.
+        """
+        market = self._market_of(stock_code)
+        if market is None:
+            return None
+        base = self._base_code(stock_code)
+        try:
+            table = self._whole_market_monthly_revenue(market)
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            logger.info("[tw-rev] fetch failed market=%s code=%s: %s", market, stock_code, exc)
+            return None
+        if not table:
+            return None
+        return table.get(base)
+
+    def _whole_market_monthly_revenue(self, market: str) -> Dict[str, dict]:
+        key = (f"{market}_monthly_rev", None)
+        cached = self._read_cache(key)
+        if cached is not None:
+            return cached
+        breaker_key = f"{market}_monthly_rev"
+        with self._key_lock(key):
+            cached = self._read_cache(key)
+            if cached is not None:
+                return cached
+            if not self._breaker.is_available(breaker_key):
+                logger.info("[tw-rev] %s circuit OPEN -> skip fetch, fail-open", breaker_key)
+                return {}
+            url = _TWSE_MONTHLY_REV_URL if market == "twse" else _TPEX_MONTHLY_REV_URL
+            market_label = "上市" if market == "twse" else "上櫃"
+            source = "TWSE-OpenAPI" if market == "twse" else "TPEx-OpenAPI"
+            try:
+                payload = self._get_json(url)
+            except Exception as exc:
+                self._breaker.record_failure(breaker_key, str(exc))
+                raise
+            self._breaker.record_success(breaker_key)
+            table_out: Dict[str, dict] = {}
+            if isinstance(payload, list):
+                for raw in payload:
+                    if not isinstance(raw, dict):
+                        continue
+                    code = str(raw.get("公司代號") or "").strip()
+                    if not code:
+                        continue
+                    ym_iso = self._minguo_ym_to_ad(raw.get("資料年月"))
+                    rev_k = _to_int(raw.get("營業收入-當月營收"))
+                    if not ym_iso or rev_k is None or rev_k < 0:
+                        continue
+                    mom = self._to_float(raw.get("營業收入-上月比較增減(%)"))
+                    yoy = self._to_float(raw.get("營業收入-去年同月增減(%)"))
+                    ytd_k = _to_int(raw.get("累計營業收入-當月累計營收"))
+                    ytd_yoy = self._to_float(raw.get("累計營業收入-前期比較增減(%)"))
+                    raw_note = str(raw.get("備註") or "").strip()
+                    note = raw_note[:120] if raw_note and raw_note not in ("-", "--", "無") else None
+                    rec: Dict[str, Any] = {
+                        "stock_code": code,
+                        "year_month": ym_iso,
+                        "market": market_label,
+                        "source": source,
+                        "unit": "thousand_twd",
+                        "monthly_revenue_thousand": rev_k,
+                        "monthly_revenue_billion_twd": round(rev_k / 100000.0, 2),
+                        "mom_pct": round(mom, 2) if mom is not None else None,
+                        "yoy_pct": round(yoy, 2) if yoy is not None else None,
+                        "ytd_revenue_billion_twd": round(ytd_k / 100000.0, 2) if ytd_k is not None else None,
+                        "ytd_yoy_pct": round(ytd_yoy, 2) if ytd_yoy is not None else None,
+                    }
+                    if note:
+                        rec["note"] = note
+                    table_out[code] = rec
+            if table_out:
+                with self._lock:
+                    self._cache[key] = table_out
+                    self._cache_at[key] = time.time()
+            return table_out
+
 
 
 

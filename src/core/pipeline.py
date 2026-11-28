@@ -763,6 +763,7 @@ class StockAnalysisPipeline:
             tw_margin_trading = None
             tw_institutional_trend = None
             tw_margin_trend = None
+            tw_monthly_revenue = None
             if not is_index and get_market_for_stock(normalize_stock_code(code)) == "tw":
                 try:
                     tw_fetcher = getattr(self.fetcher_manager, "_tw_institutional_fetcher", None)
@@ -785,6 +786,18 @@ class StockAnalysisPipeline:
                         )
                     tw_institutional_trend = tw_fetcher.get_institutional_trend(code, days=5)
                     tw_margin_trend = tw_fetcher.get_margin_trend(code, days=5)
+                    if not SearchService.is_index_or_etf(code, stock_name):
+                        tw_monthly_revenue = tw_fetcher.get_monthly_revenue(code)
+                        if tw_monthly_revenue:
+                            logger.info(
+                                "[tw-rev] %s(%s) ym=%s rev=%.2fbn_twd mom=%s yoy=%s",
+                                log_stock_name,
+                                code,
+                                tw_monthly_revenue.get("year_month"),
+                                tw_monthly_revenue.get("monthly_revenue_billion_twd", 0.0),
+                                tw_monthly_revenue.get("mom_pct"),
+                                tw_monthly_revenue.get("yoy_pct"),
+                            )
                 except Exception as e:
                     logger.warning("[tw-margin] %s(%s) fetch failed: %s", log_stock_name, code, e)
 
@@ -1080,6 +1093,7 @@ class StockAnalysisPipeline:
                 tw_margin_trading=tw_margin_trading,
                 tw_institutional_trend=tw_institutional_trend,
                 tw_margin_trend=tw_margin_trend,
+                tw_monthly_revenue=tw_monthly_revenue,
                 adr_premium=adr_premium,
             )
             enhanced_context["market_phase_context"] = market_phase_context_dict
@@ -1343,6 +1357,7 @@ class StockAnalysisPipeline:
         tw_margin_trading: Optional[Dict[str, Any]] = None,
         tw_institutional_trend: Optional[Dict[str, Any]] = None,
         tw_margin_trend: Optional[Dict[str, Any]] = None,
+        tw_monthly_revenue: Optional[Dict[str, Any]] = None,
         adr_premium: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1377,6 +1392,8 @@ class StockAnalysisPipeline:
             enhanced["tw_institutional_trend"] = dict(tw_institutional_trend)
         if isinstance(tw_margin_trend, dict) and tw_margin_trend:
             enhanced["tw_margin_trend"] = dict(tw_margin_trend)
+        if isinstance(tw_monthly_revenue, dict) and tw_monthly_revenue:
+            enhanced["tw_monthly_revenue"] = dict(tw_monthly_revenue)
         if isinstance(adr_premium, dict) and adr_premium:
             enhanced["adr_premium"] = dict(adr_premium)
 

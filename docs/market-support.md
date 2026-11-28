@@ -113,6 +113,7 @@ PY
 - 三大法人与融资融券 fetcher 已具备并发缓存防击穿和按 TWSE/TPEx 分流的熔断保护；TPEx OpenAPI 仅服务最新交易日，传入与服务日期不符的明确日期会 fail-open 返回无数据，避免错日资料静默进入报告。
 - 台股/美股通过 `YfinanceFetcher` 获取行情时以 `RealtimeSource.YFINANCE` 标识正常行情（不再误标为 `fallback`），并复用 `ticker.info` 的 `floatShares`/`sharesOutstanding` 计算换手率、回退使用 5 日量比 `volume_ratio_5d`，同时提取美股/海外机构持股与做空比率作为筹码参考；收市后日线已定稿时保留正式收盘 K 线，避免误判为盘中 `technical: partial`。
 - 台股 ETF 与双挂牌 ADR 增强：`SearchService.is_index_or_etf` / `is_leveraged_or_inverse_etf` 自动识别台股 `00xxxx.TW`/`.TWO` ETF 及杠杆/反向 ETF（如 `0050.TW`、`00631L.TW`、`00632R.TW`），分析 Prompt 跳过空置的企业财报与分红表并为杠杆/反向 ETF 附加波动耗损与期货基差警示；`data_provider/tw_adr_premium.py` 为双挂牌标的（`2330.TW↔TSM`、`2303.TW↔UMC`、`3711.TW↔ASX`、`2412.TW↔CHT`）自动计算 ADR 折溢价幅度并标注台美收盘时差与结构性溢价说明。
+- 台股官方月营收与新闻检索：`TwInstitutionalFetcher.get_monthly_revenue()` 免密钥接入上市 `t187ap05_L` 与上柜 `mopsfin_t187ap05_O` 官方 OpenAPI（全市场缓存，提供当月营收、MoM/YoY、累计 YoY 与官方备注，ETF 自动跳过）；`SearchService` 为 `.TW`/`.TWO` 使用独立繁体多维查询词（聚焦重讯、法说会、月营收、外资目标价）并纳入 TWSE/TPEx/MOPS 官方来源加权；`YfinanceFundamentalAdapter` 为台美/海外个股补充下次财报日/除息日倒数警示及前瞻 PE、分析师共识目标价。
 - 台股财务金额会使用 TWD -> 「新台币」标注，避免落入 A 股语境下的默认「元」。
 
 不承诺项：

@@ -370,6 +370,98 @@ class YfinanceFundamentalAdapter:
             result.setdefault("earnings", {})["dividend"] = dividend_payload
             result["source_chain"].append("earnings.dividend:yfinance")
 
+        # ---------------- analyst consensus & forward valuation ----------------
+        consensus_payload: Dict[str, Any] = {}
+        forward_pe = _safe_float(info.get("forwardPE"))
+        if forward_pe is not None and forward_pe > 0:
+            consensus_payload["forward_pe"] = round(forward_pe, 2)
+        target_mean = _safe_float(info.get("targetMeanPrice"))
+        if target_mean is not None and target_mean > 0:
+            consensus_payload["target_mean_price"] = round(target_mean, 2)
+        target_high = _safe_float(info.get("targetHighPrice"))
+        if target_high is not None and target_high > 0:
+            consensus_payload["target_high_price"] = round(target_high, 2)
+        target_low = _safe_float(info.get("targetLowPrice"))
+        if target_low is not None and target_low > 0:
+            consensus_payload["target_low_price"] = round(target_low, 2)
+        rec_key = str(info.get("recommendationKey") or "").strip().lower()
+        if rec_key and rec_key != "none":
+            consensus_payload["recommendation_key"] = rec_key
+        analyst_cnt = info.get("numberOfAnalystOpinions")
+        try:
+            if not isinstance(analyst_cnt, bool) and analyst_cnt is not None and int(analyst_cnt) > 0:
+                consensus_payload["analyst_count"] = int(analyst_cnt)
+        except (TypeError, ValueError):
+            pass
+        if consensus_payload:
+            if dividend_currency:
+                consensus_payload["currency"] = dividend_currency
+            result.setdefault("earnings", {})["analyst_consensus"] = consensus_payload
+            result["source_chain"].append("earnings.analyst_consensus:yfinance.info")
+
+        # ---------------- upcoming earnings & ex-dividend calendar ----------------
+        upcoming_events: Dict[str, Any] = {}
+        cal = None
+        try:
+            cal = getattr(ticker, "calendar", None)
+        except Exception:
+            cal = None
+
+        def _parse_cal_date(raw_val: Any) -> Optional[Any]:
+            if raw_val is None or isinstance(raw_val, bool):
+                return None
+            if isinstance(raw_val, datetime):
+                return raw_val.date()
+            if hasattr(raw_val, "year") and hasattr(raw_val, "month") and hasattr(raw_val, "day") and not isinstance(raw_val, (int, float, str)):
+                try:
+                    return datetime(int(raw_val.year), int(raw_val.month), int(raw_val.day)).date()
+                except Exception:
+                    return None
+            if isinstance(raw_val, (int, float)):
+                iso = _epoch_to_date(raw_val)
+                return datetime.strptime(iso, "%Y-%m-%d").date() if iso else None
+            if isinstance(raw_val, str):
+                text = raw_val.strip()[:10]
+                try:
+                    return datetime.strptime(text, "%Y-%m-%d").date()
+                except ValueError:
+                    return None
+            return None
+
+        earnings_candidates = []
+        ex_div_candidate = None
+        if isinstance(cal, dict):
+            raw_ed = cal.get("Earnings Date")
+            if isinstance(raw_ed, (list, tuple)):
+                earnings_candidates.extend(raw_ed)
+            elif raw_ed is not None:
+                earnings_candidates.append(raw_ed)
+            ex_div_candidate = cal.get("Ex-Dividend Date")
+
+        if not earnings_candidates and info.get("earningsTimestamp") is not None:
+            earnings_candidates.append(info.get("earningsTimestamp"))
+        if ex_div_candidate is None and info.get("exDividendDate") is not None:
+            ex_div_candidate = info.get("exDividendDate")
+
+        parsed_earnings = sorted(
+            d for d in (_parse_cal_date(item) for item in earnings_candidates)
+            if d is not None and d >= as_of_date
+        )
+        if parsed_earnings:
+            next_ed = parsed_earnings[0]
+            upcoming_events["next_earnings_date"] = next_ed.isoformat()
+            upcoming_events["days_to_earnings"] = (next_ed - as_of_date).days
+
+        parsed_ex_div = _parse_cal_date(ex_div_candidate)
+        if parsed_ex_div is not None and parsed_ex_div >= as_of_date:
+            upcoming_events["next_ex_dividend_date"] = parsed_ex_div.isoformat()
+            upcoming_events["days_to_ex_dividend"] = (parsed_ex_div - as_of_date).days
+
+        if upcoming_events:
+            upcoming_events["as_of"] = as_of_date.isoformat()
+            result.setdefault("earnings", {})["upcoming_events"] = upcoming_events
+            result["source_chain"].append("earnings.upcoming_events:yfinance")
+
         # ---------------- belong_boards (sector + industry) ----------------
         belong_boards: List[Dict[str, Any]] = []
         sector_name = str(info.get("sector") or info.get("sectorDisp") or "").strip()

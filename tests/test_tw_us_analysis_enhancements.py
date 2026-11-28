@@ -267,5 +267,232 @@ class TestDailyWorkflowSplitAndDbCacheContract(unittest.TestCase):
         self.assertIn("timedelta(days=90)", prune_step["run"])
 
 
+class TestTaiwanNewsQueriesAndMonthlyRevenue(unittest.TestCase):
+    def test_taiwan_news_queries_avoid_cn_exchange_keywords(self):
+        from src.search_service import SearchResponse
+
+        svc = SearchService()
+        captured_queries = []
+
+        class _FakeProvider:
+            name = "Fake"
+            is_available = True
+
+            def search(self, query, max_results=5, days=3, **_kwargs):
+                captured_queries.append(query)
+                return SearchResponse(query=query, results=[], provider="Fake", success=True)
+
+        svc._providers = [_FakeProvider()]
+        svc.search_stock_news("2330.TW", "台積電")
+        self.assertTrue(captured_queries)
+        self.assertIn("2330", captured_queries[0])
+        self.assertNotIn("2330.TW", captured_queries[0])
+        self.assertIn("台股", captured_queries[0])
+
+        captured_queries.clear()
+        svc.search_comprehensive_intel("2330.TW", "台積電", max_searches=6)
+        joined = "\n".join(captured_queries)
+        self.assertNotIn("上交所", joined)
+        self.assertNotIn("深交所", joined)
+        self.assertNotIn("cninfo", joined)
+        self.assertNotIn("2330.TW", joined)
+        self.assertIn("重訊", joined)
+        self.assertIn("月營收", joined)
+        self.assertIn("法說會", joined)
+
+    def test_tw_monthly_revenue_parses_twse_and_tpex_and_caches(self):
+        from unittest.mock import MagicMock
+        from data_provider.tw_institutional_fetcher import TwInstitutionalFetcher
+
+        twse_payload = [
+            {
+                "出表日期": "1151117",
+                "資料年月": "11510",
+                "公司代號": "2330",
+                "公司名稱": "台積電",
+                "營業收入-當月營收": "586890319",
+                "營業收入-上月比較增減(%)": "14.6589",
+                "營業收入-去年同月增減(%)": "59.7097",
+                "累計營業收入-當月累計營收": "4485617293",
+                "累計營業收入-前期比較增減(%)": "43.2904",
+                "備註": "因先進製程產品需求增加所致。",
+            }
+        ]
+        tpex_payload = [
+            {
+                "出表日期": "1151117",
+                "資料年月": "11510",
+                "公司代號": "6488",
+                "公司名稱": "環球晶",
+                "營業收入-當月營收": "5123456",
+                "營業收入-上月比較增減(%)": "3.5",
+                "營業收入-去年同月增減(%)": "-2.1",
+                "累計營業收入-當月累計營收": "50123456",
+                "累計營業收入-前期比較增減(%)": "1.2",
+                "備註": "-",
+            }
+        ]
+
+        def _fake_get(url, **_kwargs):
+            resp = MagicMock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = twse_payload if "twse.com.tw" in url else tpex_payload
+            return resp
+
+        f = TwInstitutionalFetcher(min_request_interval=0)
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_fake_get) as mock_get:
+            r2330 = f.get_monthly_revenue("2330.TW")
+            r_etf = f.get_monthly_revenue("0050.TW")
+            r6488 = f.get_monthly_revenue("6488.TWO")
+
+        self.assertIsNotNone(r2330)
+        self.assertEqual(r2330["year_month"], "2026-10")
+        self.assertEqual(r2330["monthly_revenue_billion_twd"], 5868.9)
+        self.assertEqual(r2330["mom_pct"], 14.66)
+        self.assertEqual(r2330["yoy_pct"], 59.71)
+        self.assertEqual(r2330["ytd_yoy_pct"], 43.29)
+        self.assertIn("先進製程", r2330["note"])
+
+        self.assertIsNone(r_etf)  # ETF not in corporate monthly revenue -> None (cache hit, no extra request)
+        self.assertIsNotNone(r6488)
+        self.assertEqual(r6488["source"], "TPEx-OpenAPI")
+        self.assertNotIn("note", r6488)  # '-' note ignored
+        self.assertEqual(mock_get.call_count, 2)  # 1 TWSE + 1 TPEx
+        self.assertIsNone(f.get_monthly_revenue("NVDA"))
+
+
+class TestUpcomingEventsConsensusAndUsIndices(unittest.TestCase):
+    def test_yfinance_adapter_extracts_consensus_and_upcoming_events(self):
+        from datetime import date, datetime, timezone
+        from unittest.mock import MagicMock
+        from data_provider.yfinance_fundamental_adapter import YfinanceFundamentalAdapter
+
+        class _FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                frozen = datetime(2026, 11, 27, tzinfo=timezone.utc)
+                return frozen if tz is None else frozen.astimezone(tz)
+
+        ticker = MagicMock()
+        info = {
+            "currency": "USD",
+            "financialCurrency": "USD",
+            "currentPrice": 150.0,
+            "forwardPE": 24.56,
+            "targetMeanPrice": 210.0,
+            "targetHighPrice": 250.0,
+            "targetLowPrice": 170.0,
+            "recommendationKey": "buy",
+            "numberOfAnalystOpinions": 55,
+        }
+        ticker.get_info.return_value = info
+        ticker.info = info
+        ticker.quarterly_income_stmt = pd.DataFrame()
+        ticker.quarterly_cashflow = pd.DataFrame()
+        ticker.dividends = pd.Series(dtype="float64")
+        ticker.calendar = {
+            "Earnings Date": [date(2026, 11, 10), date(2026, 12, 5)],
+            "Ex-Dividend Date": date(2026, 12, 2),
+        }
+
+        with patch("yfinance.Ticker", return_value=ticker), patch(
+            "data_provider.yfinance_fundamental_adapter.datetime", _FrozenDateTime
+        ):
+            bundle = YfinanceFundamentalAdapter().get_fundamental_bundle("NVDA")
+
+        consensus = bundle["earnings"]["analyst_consensus"]
+        self.assertEqual(consensus["forward_pe"], 24.56)
+        self.assertEqual(consensus["target_mean_price"], 210.0)
+        self.assertEqual(consensus["recommendation_key"], "buy")
+        self.assertEqual(consensus["analyst_count"], 55)
+
+        upcoming = bundle["earnings"]["upcoming_events"]
+        # Past earnings date 2026-11-10 skipped; upcoming 2026-12-05 kept (8 days away)
+        self.assertEqual(upcoming["next_earnings_date"], "2026-12-05")
+        self.assertEqual(upcoming["days_to_earnings"], 8)
+        self.assertEqual(upcoming["next_ex_dividend_date"], "2026-12-02")
+        self.assertEqual(upcoming["days_to_ex_dividend"], 5)
+
+    def test_analyzer_renders_monthly_revenue_and_countdown_warnings_bilingually(self):
+        analyzer = _make_analyzer()
+        fake_cfg = SimpleNamespace(news_max_age_days=3, news_strategy_profile="short")
+        ctx = {
+            "code": "2330.TW",
+            "date": "2026-11-27",
+            "today": {"close": 2180.0},
+            "realtime": {"price": 2180.0},
+            "tw_monthly_revenue": {
+                "year_month": "2026-10",
+                "source": "TWSE-OpenAPI",
+                "monthly_revenue_billion_twd": 5868.90,
+                "mom_pct": 14.66,
+                "yoy_pct": 59.71,
+                "ytd_revenue_billion_twd": 44856.17,
+                "ytd_yoy_pct": 43.29,
+                "note": "因先進製程產品需求增加所致。",
+            },
+            "fundamental_context": {
+                "earnings": {
+                    "status": "partial",
+                    "data": {
+                        "upcoming_events": {
+                            "next_earnings_date": "2026-12-05",
+                            "days_to_earnings": 8,
+                            "next_ex_dividend_date": "2026-12-02",
+                            "days_to_ex_dividend": 5,
+                        },
+                        "analyst_consensus": {
+                            "forward_pe": 14.54,
+                            "target_mean_price": 2616.0,
+                            "target_low_price": 2200.0,
+                            "target_high_price": 3000.0,
+                            "recommendation_key": "strong_buy",
+                            "analyst_count": 35,
+                            "currency": "TWD",
+                        },
+                    },
+                }
+            },
+        }
+        with patch("src.analyzer.get_config", return_value=fake_cfg):
+            zh_prompt = analyzer._format_prompt(ctx, "TSMC", report_language="zh")
+            en_prompt = analyzer._format_prompt(ctx, "TSMC", report_language="en")
+
+        self.assertIn("### 台股官方月营收", zh_prompt)
+        self.assertIn("+59.71%", zh_prompt)
+        self.assertIn("财报事件倒数警示", zh_prompt)
+        self.assertIn("除息日临近", zh_prompt)
+        self.assertIn("前瞻市盈率 (Forward PE)", zh_prompt)
+        self.assertIn("+20.0%", zh_prompt)
+
+        self.assertIn("### Taiwan Official Monthly Revenue", en_prompt)
+        self.assertIn("NT$586.89B", en_prompt)
+        self.assertIn("Earnings event countdown", en_prompt)
+        self.assertIn("Ex-dividend approaching", en_prompt)
+        self.assertIn("Forward PE", en_prompt)
+        self.assertEqual(_cjk_chars(en_prompt), "")
+
+    def test_us_indices_include_sox_and_rut(self):
+        from data_provider.us_index_mapping import get_us_index_yf_symbol, is_us_index_code
+        from data_provider.yfinance_fetcher import YfinanceFetcher
+
+        self.assertTrue(is_us_index_code("SOX"))
+        self.assertEqual(get_us_index_yf_symbol("SOX"), ("^SOX", "费城半导体指数"))
+        self.assertEqual(get_us_index_yf_symbol("RUT"), ("^RUT", "罗素2000指数"))
+
+        seen_codes = []
+        fetcher = YfinanceFetcher()
+        with patch.object(
+            fetcher,
+            "_fetch_yf_ticker_data",
+            side_effect=lambda _yf, _sym, name, code: seen_codes.append(code) or {"code": code, "name": name, "current": 100.0, "change_pct": 1.0},
+        ):
+            res = fetcher._get_us_main_indices(object())
+
+        self.assertIsNotNone(res)
+        self.assertEqual(seen_codes, ["SPX", "IXIC", "DJI", "SOX", "RUT", "VIX"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

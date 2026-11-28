@@ -2477,16 +2477,18 @@ class SearchService:
     )
     _OFFICIAL_SOURCE_TERMS = (
         "cninfo", "sse.com", "szse.cn", "hkexnews", "sec.gov", "nasdaq.com",
-        "nyse.com", "上交所", "深交所", "港交所", "证券交易所",
+        "nyse.com", "twse.com.tw", "tpex.org.tw", "mops.twse.com.tw",
+        "上交所", "深交所", "港交所", "证券交易所", "證交所", "櫃買中心", "公開資訊觀測站",
     )
     _OFFICIAL_SOURCE_HOSTS = (
         "cninfo.com.cn", "sse.com", "sse.com.cn", "szse.cn", "hkexnews.hk",
-        "sec.gov", "nasdaq.com", "nyse.com",
+        "sec.gov", "nasdaq.com", "nyse.com", "twse.com.tw", "tpex.org.tw", "mops.twse.com.tw",
     )
     _OFFICIAL_SOURCE_LABELS = (
         "cninfo", "hkexnews", "巨潮资讯", "巨潮资讯网",
         "上交所", "深交所", "港交所", "证券交易所",
         "上海证券交易所", "深圳证券交易所", "香港交易所", "香港联合交易所",
+        "證交所", "臺灣證券交易所", "台灣證券交易所", "櫃買中心", "證券櫃檯買賣中心", "公開資訊觀測站",
     )
     _LOW_QUALITY_DOWNLOAD_ACTION_TERMS = (
         "下载", "安装", "下载安装", "下载安装到手机", "下载链接",
@@ -2699,6 +2701,17 @@ class SearchService:
             self.news_window_days,
         )
     
+    @staticmethod
+    def _is_taiwan_stock(stock_code: str) -> bool:
+        """Judge whether a stock code carries an explicit Taiwan suffix (.TW / .TWO)."""
+        upper = (stock_code or "").strip().upper()
+        return upper.endswith(".TW") or upper.endswith(".TWO")
+
+    @staticmethod
+    def _taiwan_bare_code(stock_code: str) -> str:
+        """Strip .TW / .TWO suffix for Taiwan Chinese news queries (e.g. '2330.TW' -> '2330')."""
+        return (stock_code or "").strip().upper().rsplit(".", 1)[0]
+
     @staticmethod
     def _is_foreign_stock(stock_code: str) -> bool:
         """判断是否为港股或美股。
@@ -4474,6 +4487,9 @@ class SearchService:
         if focus_keywords:
             # 如果提供了关键词，直接使用关键词作为查询
             query = " ".join(focus_keywords)
+        elif self._is_taiwan_stock(stock_code):
+            tw_code = self._taiwan_bare_code(stock_code)
+            query = f"{stock_name} {tw_code} 台股 最新消息"
         elif prefer_chinese:
             # 指数 target 的 stock_code 可能为空（Agent 工具 _resolve_search_subject
             # 有意只传显示名），空 code 直接省略，避免拼出 "上证50  股票" 双空格。
@@ -4827,6 +4843,7 @@ class SearchService:
         search_count = 0
 
         is_foreign = self._is_foreign_stock(stock_code)
+        is_taiwan = self._is_taiwan_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
         if is_foreign:
@@ -4878,6 +4895,64 @@ class SearchService:
                     'query': (
                         f"{effective_name} {stock_code} index sector allocation holdings"
                         if is_index_etf else f"{effective_name} industry competitors market share outlook"
+                    ),
+                    'desc': 'industry analysis',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+            ]
+        elif is_taiwan:
+            tw_code = self._taiwan_bare_code(stock_code)
+            search_dimensions = [
+                {
+                    'name': 'latest_news',
+                    'query': f"{stock_name} {tw_code} 台股 最新 新聞 重大 動態",
+                    'desc': 'latest news',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'market_analysis',
+                    'query': f"{stock_name} {tw_code} 外資 法人 目標價 評等 報告",
+                    'desc': 'analyst research',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'risk_check',
+                    'query': (
+                        f"{stock_name} {tw_code} 指數走勢 折溢價 追蹤誤差 成分股"
+                        if is_index_etf else f"{stock_name} {tw_code} 利空 風險 降評 下修財測 減資 訴訟"
+                    ),
+                    'desc': 'risk check',
+                    'tavily_topic': None if is_index_etf else 'news',
+                    'strict_freshness': not is_index_etf,
+                },
+                {
+                    'name': 'announcements',
+                    'query': (
+                        f"{stock_name} {tw_code} 公告 配息 除息 成分股調整"
+                        if is_index_etf else f"{stock_name} {tw_code} 重訊 法說會 除息 公開資訊觀測站"
+                    ),
+                    'desc': 'company announcements',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'earnings',
+                    'query': (
+                        f"{stock_name} {tw_code} 成分股 表現 配息 殖利率"
+                        if is_index_etf else f"{stock_name} {tw_code} 月營收 財報 EPS 法說會 財測"
+                    ),
+                    'desc': 'earnings outlook',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'industry',
+                    'query': (
+                        f"{stock_name} {tw_code} 成分股 權重 產業配置"
+                        if is_index_etf else f"{stock_name} {tw_code} 產業 供應鏈 競爭對手 市占率 展望"
                     ),
                     'desc': 'industry analysis',
                     'tavily_topic': None,

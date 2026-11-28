@@ -5093,6 +5093,199 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
 """
 
+        # 添加台股官方月营收（TWSE/TPEx 免密钥 OpenAPI，ETF 跳过）
+        tw_rev = context.get("tw_monthly_revenue") if isinstance(context, dict) else None
+        if (
+            not context.get("is_index_etf")
+            and isinstance(tw_rev, dict)
+            and tw_rev.get("year_month")
+            and tw_rev.get("monthly_revenue_billion_twd") is not None
+        ):
+            ym = tw_rev["year_month"]
+            rev_bn = float(tw_rev["monthly_revenue_billion_twd"])
+            mom_txt = f"{float(tw_rev['mom_pct']):+.2f}%" if tw_rev.get("mom_pct") is not None else "N/A"
+            yoy_txt = f"{float(tw_rev['yoy_pct']):+.2f}%" if tw_rev.get("yoy_pct") is not None else "N/A"
+            ytd_bn = (
+                f"{float(tw_rev['ytd_revenue_billion_twd']):,.2f}"
+                if tw_rev.get("ytd_revenue_billion_twd") is not None
+                else "N/A"
+            )
+            ytd_yoy_txt = f"{float(tw_rev['ytd_yoy_pct']):+.2f}%" if tw_rev.get("ytd_yoy_pct") is not None else "N/A"
+            rev_src = tw_rev.get("source") or "TWSE/TPEx"
+            if english:
+                ytd_b_en = (
+                    f"NT${float(tw_rev['ytd_revenue_billion_twd']) / 10.0:,.2f}B"
+                    if tw_rev.get("ytd_revenue_billion_twd") is not None
+                    else "N/A"
+                )
+                prompt += f"""
+### Taiwan Official Monthly Revenue ({rev_src})
+| Metric | Value | Note |
+|------|------|------|
+| Reporting Month | {ym} | Monthly filing (due by 10th of following month) |
+| Monthly Revenue | NT${rev_bn / 10.0:,.2f}B | Official MOPS revenue |
+| MoM Change | {mom_txt} | Month-over-month momentum |
+| YoY Change | {yoy_txt} | Year-over-year growth (core catalyst for TW tech) |
+| YTD Revenue / YoY | {ytd_b_en} / {ytd_yoy_txt} | Cumulative year-to-date trend |
+"""
+            else:
+                note_row = (
+                    f"| 公司官方备注 | {tw_rev['note']} | 来自公开资讯观测站 |\n"
+                    if tw_rev.get("note")
+                    else ""
+                )
+                prompt += f"""
+### 台股官方月营收（{rev_src}）
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 资料年月 | {ym} | 台股每月 10 日前强制公告，为重要基本面催化 |
+| 当月营收 | {rev_bn:,.2f} 亿元新台币 | 官方合并营收口径 |
+| 月增率 (MoM) | {mom_txt} | 环比动能变化 |
+| 年增率 (YoY) | {yoy_txt} | 同比成长，台股科技/半导体核心观察指标 |
+| 累计营收 / 累计年增率 | {ytd_bn} 亿元新台币 / {ytd_yoy_txt} | 年初至今累计成长趋势 |
+{note_row}"""
+
+        # 添加即将到来事件（财报日/除息日倒数）与分析师前瞻共识（台美/海外通用，ETF 跳过）
+        upcoming_events = (
+            earnings_data.get("upcoming_events", {})
+            if isinstance(earnings_data, dict)
+            else {}
+        )
+        analyst_consensus = (
+            earnings_data.get("analyst_consensus", {})
+            if isinstance(earnings_data, dict)
+            else {}
+        )
+        has_upcoming = isinstance(upcoming_events, dict) and bool(
+            upcoming_events.get("next_earnings_date") or upcoming_events.get("next_ex_dividend_date")
+        )
+        has_consensus = isinstance(analyst_consensus, dict) and any(
+            analyst_consensus.get(k) is not None
+            for k in ("forward_pe", "target_mean_price", "recommendation_key")
+        )
+        if not context.get("is_index_etf") and (has_upcoming or has_consensus):
+            curr_px = None
+            rt_ctx = context.get("realtime") if isinstance(context, dict) else None
+            today_ctx = context.get("today") if isinstance(context, dict) else None
+            for cand in (
+                rt_ctx.get("price") if isinstance(rt_ctx, dict) else None,
+                today_ctx.get("close") if isinstance(today_ctx, dict) else None,
+            ):
+                try:
+                    if cand is not None and float(cand) > 0:
+                        curr_px = float(cand)
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+            ev_rows: List[str] = []
+            ev_warnings: List[str] = []
+            if has_upcoming:
+                ed = upcoming_events.get("next_earnings_date")
+                d_ed = upcoming_events.get("days_to_earnings")
+                if ed:
+                    if english:
+                        cd = f" (in {int(d_ed)} days)" if d_ed is not None else ""
+                        ev_rows.append(f"| Next Earnings Date | {ed}{cd} | Key binary volatility event |")
+                        if d_ed is not None and 0 <= int(d_ed) <= 14:
+                            ev_warnings.append(
+                                f"Earnings event countdown: earnings release in {int(d_ed)} day(s) ({ed}); "
+                                "highlight earnings-gap volatility risk and position sizing rather than recommending aggressive pre-earnings chasing."
+                            )
+                    else:
+                        cd = f"（距今 {int(d_ed)} 天）" if d_ed is not None else ""
+                        ev_rows.append(f"| 下次财报/法说日 | {ed}{cd} | 重大事件窗口，须防范财报跳空风险 |")
+                        if d_ed is not None and 0 <= int(d_ed) <= 14:
+                            ev_warnings.append(
+                                f"⚠️ 财报事件倒数警示：距离下次财报公布仅剩 {int(d_ed)} 天（{ed}），"
+                                "请明确提醒财报跳空高波动风险与仓位控制，避免建议重仓硬扛财报赌局。"
+                            )
+                exd = upcoming_events.get("next_ex_dividend_date")
+                d_exd = upcoming_events.get("days_to_ex_dividend")
+                if exd:
+                    if english:
+                        cd = f" (in {int(d_exd)} days)" if d_exd is not None else ""
+                        ev_rows.append(f"| Next Ex-Dividend Date | {exd}{cd} | Reference price adjusts downward on ex-date |")
+                        if d_exd is not None and 0 <= int(d_exd) <= 7:
+                            ev_warnings.append(
+                                f"Ex-dividend approaching in {int(d_exd)} day(s) ({exd}); note technical reference price gap on ex-date."
+                            )
+                    else:
+                        cd = f"（距今 {int(d_exd)} 天）" if d_exd is not None else ""
+                        ev_rows.append(f"| 下次除息日 | {exd}{cd} | 除息当日参考价将扣除股利产生跳空缺口 |")
+                        if d_exd is not None and 0 <= int(d_exd) <= 7:
+                            ev_warnings.append(
+                                f"除息日临近（{exd}，距今 {int(d_exd)} 天），短线技术面与均线须留意除息参考价缺口。"
+                            )
+
+            if has_consensus:
+                f_pe = analyst_consensus.get("forward_pe")
+                t_mean = analyst_consensus.get("target_mean_price")
+                t_low = analyst_consensus.get("target_low_price")
+                t_high = analyst_consensus.get("target_high_price")
+                rec_k = analyst_consensus.get("recommendation_key")
+                cnt = analyst_consensus.get("analyst_count")
+                ccy = analyst_consensus.get("currency") or ""
+                ccy_prefix = f"{ccy} " if ccy else ""
+
+                if f_pe is not None:
+                    if english:
+                        ev_rows.append(f"| Forward PE | {float(f_pe):.2f}x | Forward earnings valuation anchor |")
+                    else:
+                        ev_rows.append(f"| 前瞻市盈率 (Forward PE) | {float(f_pe):.2f}x | 相比历史 PE 更贴合高成长股估值 |")
+                if t_mean is not None:
+                    upside_txt = ""
+                    if curr_px is not None and curr_px > 0:
+                        up_pct = (float(t_mean) - curr_px) / curr_px * 100.0
+                        upside_txt = f" ({up_pct:+.1f}% vs current)" if english else f"（较现价 {up_pct:+.1f}%）"
+                    range_txt = (
+                        f" | Range {float(t_low):,.2f}-{float(t_high):,.2f}"
+                        if (t_low is not None and t_high is not None and english)
+                        else (
+                            f"，区间 {float(t_low):,.2f}–{float(t_high):,.2f}"
+                            if (t_low is not None and t_high is not None)
+                            else ""
+                        )
+                    )
+                    if english:
+                        ev_rows.append(
+                            f"| Analyst Mean Target | {ccy_prefix}{float(t_mean):,.2f}{upside_txt}{range_txt} | Consensus expectation anchor only |"
+                        )
+                    else:
+                        ev_rows.append(
+                            f"| 分析师共识目标价 | {ccy_prefix}{float(t_mean):,.2f}{upside_txt}{range_txt} | 仅作市场预期锚点，非买卖依据 |"
+                        )
+                if rec_k:
+                    cnt_txt = f" ({int(cnt)} analysts)" if (cnt and english) else (f"（{int(cnt)} 位分析师）" if cnt else "")
+                    if english:
+                        ev_rows.append(f"| Consensus Rating | {rec_k}{cnt_txt} | Street rating distribution |")
+                    else:
+                        ev_rows.append(f"| 分析师共识评级 | {rec_k}{cnt_txt} | 华尔街/外资机构评级参考 |")
+
+            if ev_rows:
+                rows_block = "\n".join(ev_rows)
+                warn_block = "\n".join(f"> {w}" for w in ev_warnings)
+                if english:
+                    guard = "> Guardrail: analyst target prices and ratings are consensus anchors only, never direct buy/sell instructions."
+                    prompt += f"""
+### Upcoming Events & Analyst Forward Consensus
+| Metric | Value | Note |
+|------|------|------|
+{rows_block}
+
+{guard}
+{warn_block + chr(10) if warn_block else ""}"""
+                else:
+                    guard = "> 约束：分析师目标价与评级仅作为市场预期锚点，严禁直接作为买卖指令。"
+                    prompt += f"""
+### 即将到来事件与分析师前瞻共识
+| 指标 | 数值 | 说明 |
+|------|------|------|
+{rows_block}
+
+{guard}
+{warn_block + chr(10) if warn_block else ""}"""
+
         capital_flow_block = (
             fundamental_context.get("capital_flow", {})
             if isinstance(fundamental_context, dict)
