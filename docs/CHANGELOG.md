@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 台股个股分析接入 TWSE `MI_MARGN` 与 TPEx `tpex_mainboard_margin_balance` 免密钥开放资料，补充融资/融券余额与日增减、券资比与资券互抵，并与三大法人汇总为台股筹码摘要；美股复用 `yfinance` `ticker.info` 补充机构持股、内部人持股、做空占流通股比例与空单回补天数，消除台美股报告中误导性的 A 股 CYQ「筹码分布未启用」提示。
+- [改进] 补齐美股/台股/海外个股量比（实时缺失时回退至 5 日量比 `volume_ratio_5d`）与换手率（基于 `floatShares`/`sharesOutstanding` 计算），并修复无换手率标的（如 ETF）在通知中拼接多余 `%` 的显示问题。
+- [修复] `YfinanceFetcher` 正常行情改为 `RealtimeSource.YFINANCE`（不再误标为 `quote: fallback`），收市后日线已定稿时不再覆盖为 `is_estimated`（消除误判 `technical: partial`），并为非 A 股市场将 A 股 CYQ 标记为 `chip_not_supported`。
 - [新功能] 台股大盘复盘接入 TWSE 官方免密钥 RWD 开放资料（`MI_INDEX?type=MS` 与 `BFI82U`），补充上市股票涨跌/涨跌停/持平家数、集中市场总成交额与三大法人（外资、投信、自营商含自行与避险、合计）买卖超金额并注入 Prompt、报告表格及结构化 payload（双端点独立 fail-open）。
 - [修复] 在 `src/core/config_registry.py` 补齐 `GOOGLE_NEWS_RSS_ENABLED` 配置项注册与帮助元数据，确保与 `.env.example` 和设置 Schema 契约一致。
 - [新功能] Telegram 推送消息自动通过 OpenCC `s2twp` 转换为台湾繁体中文（含台湾常用词转换并保留链接 URL；依赖不可用时 fail-open 回退原文不阻塞推送）。

@@ -607,7 +607,7 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
             )
         )
         quote_block = pack.blocks["quote"]
-        self.assertEqual(quote_block.status.value, "fallback")
+        self.assertEqual(quote_block.status.value, "available")
         self.assertEqual(quote_block.items["quote_date"].value, "2026-11-13")
         self.assertNotIn("quote_stale", quote_block.warnings)
         self.assertNotIn("provider_timestamp", quote_block.metadata)
@@ -627,6 +627,87 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["price_change_ratio"], -0.12)
         self.assertEqual(enhanced["volume_change_ratio"], 0.45)
         self.assertEqual(enhanced["today"]["pct_chg"], -0.12)
+
+    def test_postmarket_finalized_bar_keeps_technical_available_and_fills_volume_ratio(self) -> None:
+        now = datetime(2026, 11, 27, 16, 10, tzinfo=ZoneInfo("Asia/Taipei"))
+        phase = build_market_phase_context(market="tw", current_time=now).to_dict()
+        self.assertEqual(phase["phase"], "postmarket")
+        self.assertFalse(phase["is_partial_bar"])
+
+        stored_context = {
+            "code": "2330.TW",
+            "date": "2026-11-27",
+            "today": {
+                "date": "2026-11-27",
+                "open": 2150.0,
+                "high": 2185.0,
+                "low": 2145.0,
+                "close": 2180.0,
+                "volume": 38000000,
+                "pct_chg": 1.4,
+            },
+            "yesterday": {
+                "date": "2026-11-26",
+                "close": 2150.0,
+                "volume": 32000000,
+            },
+        }
+        quote = UnifiedRealtimeQuote(
+            code="2330.TW",
+            name="台積電",
+            source=RealtimeSource.YFINANCE,
+            price=2180.0,
+            change_pct=1.4,
+            pre_close=2150.0,
+            open_price=2150.0,
+            high=2185.0,
+            low=2145.0,
+            volume=38000000,
+            turnover_rate=0.16,
+            quote_date="2026-11-27",
+        )
+        trend = TrendAnalysisResult(code="2330.TW")
+        trend.ma5, trend.ma10, trend.ma20 = 2140.0, 2110.0, 2080.0
+        trend.volume_ratio_5d = 1.24
+
+        with patch("src.core.pipeline.get_market_now", return_value=now):
+            enhanced = self.pipeline._enhance_context(
+                stored_context,
+                quote,
+                None,
+                trend,
+                stock_name="台積電",
+                fundamental_context={"status": "ok"},
+                market_phase_context=phase,
+            )
+
+        self.assertEqual(enhanced["realtime"]["volume_ratio"], 1.24)
+        self.assertEqual(enhanced["realtime"]["turnover_rate"], 0.16)
+        self.assertNotIn("is_estimated", enhanced["today"])
+        self.assertFalse(str(enhanced["today"].get("data_source") or "").startswith("realtime:"))
+
+        pack = AnalysisContextBuilder.build(
+            PipelineAnalysisArtifacts(
+                code="2330.TW",
+                stock_name="台積電",
+                market="tw",
+                phase=phase,
+                base_context=stored_context,
+                enhanced_context=enhanced,
+                realtime_quote=quote,
+                trend_result=trend,
+                chip_data=None,
+                fundamental_context={"status": "ok"},
+                news_context=None,
+                news_result_count=None,
+                metadata={"chip_not_supported": True},
+            )
+        )
+        self.assertEqual(pack.blocks["quote"].status.value, "available")
+        self.assertEqual(pack.blocks["technical"].status.value, "available")
+        self.assertEqual(pack.blocks["chip"].status.value, "not_supported")
+        self.assertNotIn("quote: fallback", pack.data_quality.limitations)
+        self.assertNotIn("technical: partial", pack.data_quality.limitations)
 
     def test_yfinance_recomputes_derived_indicators_after_history_override(self) -> None:
         ticker = MagicMock()

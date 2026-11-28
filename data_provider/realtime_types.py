@@ -105,6 +105,7 @@ class RealtimeSource(Enum):
     STOOQ = "stooq"                 # Stooq 美股兜底
     LONGBRIDGE = "longbridge"       # 长桥（美股/港股兜底）
     FUTU = "futu"                   # 富途 OpenD（港股）
+    YFINANCE = "yfinance"           # Yahoo Finance（美股/港股/日韩台）
     FALLBACK = "fallback"           # 降级兜底
 
 
@@ -162,6 +163,7 @@ class UnifiedRealtimeQuote:
     change_60d: Optional[float] = None      # 60日涨跌幅(%)
     high_52w: Optional[float] = None        # 52周最高
     low_52w: Optional[float] = None         # 52周最低
+    ownership: Optional[Dict[str, Any]] = None  # 机构持股/内部人持股/做空比率等（可选）
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（过滤 None 值）"""
@@ -178,7 +180,7 @@ class UnifiedRealtimeQuote:
             'volume_ratio', 'turnover_rate', 'amplitude',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
-            'change_60d', 'high_52w', 'low_52w'
+            'change_60d', 'high_52w', 'low_52w', 'ownership'
         ]
         for f in optional_fields:
             val = getattr(self, f, None)

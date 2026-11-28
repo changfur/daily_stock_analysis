@@ -41,6 +41,8 @@ _T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
 _TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
 _BFI82U_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
 _MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+_MI_MARGN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+_TPEX_MARGIN_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance"
 _COUNT_WITH_LIMIT_RE = re.compile(r"^\s*([\d,]+)\s*(?:\(\s*([\d,]+)\s*\))?\s*$")
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -654,4 +656,222 @@ class TwInstitutionalFetcher:
             "dealer_hedge_net_twd": dealer_hedge,
             "total_net_twd": resolved_total,
         }
+
+    # ---------------------------------------- TW per-stock margin trading (融資融券)
+    def get_margin_trading(
+        self, stock_code: str, date: Optional[str] = None
+    ) -> Optional[dict]:
+        """Return the normalized 融資融券 record (unit: lots / 張) for one TW stock, or ``None``.
+
+        Supports ``.TW`` (TWSE ``MI_MARGN``) and ``.TWO`` (TPEx OpenAPI
+        ``tpex_mainboard_margin_balance``). Whole-market single-day table is cached
+        per (market, date) and filtered per stock. Strictly fail-open: any error
+        returns ``None``.
+        """
+        market = self._market_of(stock_code)
+        if market is None:
+            return None
+        base = self._base_code(stock_code)
+        try:
+            table = self._whole_market_margin(market, date)
+        except Exception as exc:  # noqa: BLE001 - fail-open by contract
+            logger.info(
+                "[tw-margin] fetch failed market=%s code=%s: %s", market, stock_code, exc
+            )
+            return None
+        if not table:
+            return None
+        record = table.get(base)
+        if record is not None and date and market == "tpex":
+            requested = self._norm_ad_date(date)
+            if requested and record.get("date") != requested:
+                logger.info(
+                    "[tw-margin] TPEx %s requested date %s != served %s -> fail-open",
+                    base,
+                    requested,
+                    record.get("date"),
+                )
+                return None
+        return record
+
+    def _whole_market_margin(self, market: str, date: Optional[str]) -> Dict[str, dict]:
+        ad_date = self._norm_ad_date(date) if market == "twse" else None
+        key = (f"{market}_margin", ad_date)
+        cached = self._read_cache(key)
+        if cached is not None:
+            return cached
+        breaker_key = f"{market}_margin"
+        with self._key_lock(key):
+            cached = self._read_cache(key)
+            if cached is not None:
+                return cached
+            if not self._breaker.is_available(breaker_key):
+                logger.info("[tw-margin] %s circuit OPEN -> skip fetch, fail-open", breaker_key)
+                return {}
+            try:
+                table = (
+                    self._fetch_twse_margin(ad_date)
+                    if market == "twse"
+                    else self._fetch_tpex_margin()
+                )
+            except Exception as exc:
+                self._breaker.record_failure(breaker_key, str(exc))
+                raise
+            self._breaker.record_success(breaker_key)
+            if table:
+                with self._lock:
+                    self._cache[key] = table
+                    self._cache_at[key] = time.time()
+            return table
+
+    def _fetch_twse_margin(self, ad_date: Optional[str]) -> Dict[str, dict]:
+        params: Dict[str, str] = {"response": "json", "selectType": "ALL"}
+        if ad_date:
+            params["date"] = ad_date
+        payload = self._get_json(_MI_MARGN_URL, params)
+        if not isinstance(payload, dict) or payload.get("stat") != "OK":
+            return {}
+        payload_date = self._norm_ad_date(payload.get("date"))
+        if ad_date and payload_date and payload_date != ad_date:
+            logger.info(
+                "[tw-margin] TWSE MI_MARGN requested date %s != served %s -> fail-open",
+                ad_date,
+                payload_date,
+            )
+            return {}
+        resolved_date = payload_date or ad_date
+        if not resolved_date:
+            return {}
+        tables = payload.get("tables")
+        if not isinstance(tables, list):
+            return {}
+
+        target_table = None
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            fields = table.get("fields")
+            if (
+                isinstance(fields, list)
+                and "代號" in fields
+                and fields.count("前日餘額") >= 2
+                and fields.count("今日餘額") >= 2
+            ):
+                target_table = table
+                break
+        if target_table is None:
+            logger.info("[tw-margin] TWSE MI_MARGN detail table missing/renamed -> fail-open")
+            return {}
+
+        fields = target_table["fields"]
+        rows = target_table.get("data")
+        if not isinstance(rows, list) or not rows:
+            return {}
+
+        code_idx = fields.index("代號")
+        prev_indices = [i for i, f in enumerate(fields) if f == "前日餘額"]
+        curr_indices = [i for i, f in enumerate(fields) if f == "今日餘額"]
+        m_prev_idx, s_prev_idx = prev_indices[0], prev_indices[1]
+        m_curr_idx, s_curr_idx = curr_indices[0], curr_indices[1]
+        offset_idx = fields.index("資券互抵") if "資券互抵" in fields else None
+        req_max = max(code_idx, m_prev_idx, m_curr_idx, s_prev_idx, s_curr_idx)
+
+        table_out: Dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or req_max >= len(row):
+                continue
+            code = str(row[code_idx] or "").strip()
+            if not code:
+                continue
+            m_prev = _to_int(row[m_prev_idx])
+            m_curr = _to_int(row[m_curr_idx])
+            s_prev = _to_int(row[s_prev_idx])
+            s_curr = _to_int(row[s_curr_idx])
+            if m_prev is None or m_curr is None or s_prev is None or s_curr is None:
+                continue
+            offsetting = (
+                _to_int(row[offset_idx])
+                if offset_idx is not None and offset_idx < len(row)
+                else None
+            )
+            table_out[code] = self._build_margin_record(
+                code=code,
+                ad_date=resolved_date,
+                market_label="上市",
+                source="TWSE-MI_MARGN",
+                margin_prev=m_prev,
+                margin_curr=m_curr,
+                short_prev=s_prev,
+                short_curr=s_curr,
+                offsetting=offsetting,
+            )
+        return table_out
+
+    def _fetch_tpex_margin(self) -> Dict[str, dict]:
+        payload = self._get_json(_TPEX_MARGIN_URL)
+        if not isinstance(payload, list) or not payload:
+            return {}
+        table_out: Dict[str, dict] = {}
+        for raw in payload:
+            if not isinstance(raw, dict):
+                continue
+            code = str(raw.get("SecuritiesCompanyCode", "")).strip()
+            if not code:
+                continue
+            ad_date = minguo_to_ad(raw.get("Date", ""))
+            if ad_date is None:
+                continue
+            m_prev = _to_int(raw.get("MarginPurchaseBalancePreviousDay"))
+            m_curr = _to_int(raw.get("MarginPurchaseBalance"))
+            s_prev = _to_int(raw.get("ShortSaleBalancePreviousDay"))
+            s_curr = _to_int(raw.get("ShortSaleBalance"))
+            if m_prev is None or m_curr is None or s_prev is None or s_curr is None:
+                continue
+            offsetting = _to_int(raw.get("Offsetting"))
+            table_out[code] = self._build_margin_record(
+                code=code,
+                ad_date=ad_date,
+                market_label="上櫃",
+                source="TPEx-OpenAPI",
+                margin_prev=m_prev,
+                margin_curr=m_curr,
+                short_prev=s_prev,
+                short_curr=s_curr,
+                offsetting=offsetting,
+            )
+        return table_out
+
+    @staticmethod
+    def _build_margin_record(
+        *,
+        code: str,
+        ad_date: str,
+        market_label: str,
+        source: str,
+        margin_prev: int,
+        margin_curr: int,
+        short_prev: int,
+        short_curr: int,
+        offsetting: Optional[int] = None,
+    ) -> dict:
+        ratio = round((short_curr / margin_curr) * 100.0, 2) if margin_curr > 0 else 0.0
+        rec: Dict[str, Any] = {
+            "stock_code": code,
+            "date": ad_date,
+            "date_iso": _format_ad_date_iso(ad_date),
+            "market": market_label,
+            "source": source,
+            "unit": "lots",
+            "margin_prev_balance": margin_prev,
+            "margin_balance": margin_curr,
+            "margin_change": margin_curr - margin_prev,
+            "short_prev_balance": short_prev,
+            "short_balance": short_curr,
+            "short_change": short_curr - short_prev,
+            "margin_short_ratio_pct": ratio,
+        }
+        if offsetting is not None:
+            rec["offsetting"] = offsetting
+        return rec
+
 

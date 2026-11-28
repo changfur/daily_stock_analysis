@@ -320,3 +320,82 @@ class TestFillChipStructureIfNeeded(unittest.TestCase):
         self.assertEqual(cs["avg_cost"], 1850.0)
         self.assertEqual(cs["concentration"], "0.00%")
         self.assertNotIn("chip_unavailable_reason", dp)
+
+    def test_offshore_chip_summary_for_tw_and_us_replaces_generic_unavailable_reason(self) -> None:
+        from src.analyzer import GeminiAnalyzer, build_offshore_chip_summary
+
+        tw_ctx = {
+            "code": "2330.TW",
+            "stock_name": "台積電",
+            "date": "2026-11-27",
+            "today": {"close": 2180.0, "ma5": 2140.0, "ma10": 2110.0, "ma20": 2080.0},
+            "fundamental_context": {
+                "institution": {
+                    "status": "ok",
+                    "data": {
+                        "foreign_net": -1912490,
+                        "trust_net": 919216,
+                        "dealer_net": 996850,
+                        "total_net": 3576,
+                        "unit": "shares",
+                        "date": "20261127",
+                        "source": "TWSE-T86",
+                    },
+                }
+            },
+            "tw_margin_trading": {
+                "date": "20261127",
+                "date_iso": "2026-11-27",
+                "source": "TWSE-MI_MARGN",
+                "margin_balance": 28191,
+                "margin_change": -1076,
+                "short_balance": 42,
+                "short_change": 15,
+                "margin_short_ratio_pct": 0.15,
+                "offsetting": 21,
+            },
+        }
+        tw_summary = build_offshore_chip_summary(tw_ctx, "zh")
+        self.assertIsNotNone(tw_summary)
+        self.assertIn("三大法人合计", tw_summary)
+        self.assertIn("融资 28,191张(-1,076)", tw_summary)
+        self.assertIn("融券 42张(+15)", tw_summary)
+
+        result = self._make_result(dashboard={"data_perspective": {"chip_structure": {"profit_ratio": "N/A"}}})
+        normalize_chip_structure_availability(result, None, offshore_chip_summary=tw_summary)
+        dp = result.dashboard["data_perspective"]
+        self.assertEqual(dp["chip_structure"], {})
+        self.assertEqual(dp["chip_unavailable_reason"], tw_summary)
+
+        prompt_tw = GeminiAnalyzer.__new__(GeminiAnalyzer)._format_prompt(tw_ctx, "台積電")
+        self.assertIn("融资融券动向", prompt_tw)
+        self.assertIn("28,191 张（-1,076 张）", prompt_tw)
+        self.assertNotIn("筹码分布未启用或数据源暂不可用", prompt_tw)
+
+        us_ctx = {
+            "code": "NVDA",
+            "stock_name": "NVIDIA",
+            "date": "2026-11-27",
+            "today": {"close": 150.5, "ma5": 148.0, "ma10": 145.0, "ma20": 142.0},
+            "realtime": {
+                "price": 150.5,
+                "volume_ratio": 1.15,
+                "turnover_rate": 0.8,
+                "ownership": {
+                    "held_pct_institutions": 71.59,
+                    "held_pct_insiders": 4.04,
+                    "short_pct_float": 1.32,
+                    "short_ratio": 1.58,
+                },
+            },
+        }
+        us_summary = build_offshore_chip_summary(us_ctx, "zh")
+        self.assertIsNotNone(us_summary)
+        self.assertIn("机构持股 71.59%", us_summary)
+        self.assertIn("做空占比 1.32%", us_summary)
+
+        prompt_us = GeminiAnalyzer.__new__(GeminiAnalyzer)._format_prompt(us_ctx, "NVIDIA")
+        self.assertIn("机构持股与做空筹码", prompt_us)
+        self.assertIn("71.59%", prompt_us)
+        self.assertNotIn("筹码分布未启用或数据源暂不可用", prompt_us)
+

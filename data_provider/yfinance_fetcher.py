@@ -925,7 +925,7 @@ class YfinanceFetcher(BaseFetcher):
             quote = UnifiedRealtimeQuote(
                 code=user_code,
                 name=index_name or user_code,
-                source=RealtimeSource.FALLBACK,
+                source=RealtimeSource.YFINANCE,
                 market="us",
                 currency=str(ticker_info.get("currency") or "").upper() or None,
                 data_quality="partial" if missing_fields else "ok",
@@ -1100,6 +1100,60 @@ class YfinanceFetcher(BaseFetcher):
             # 复用上方已获取的 ticker_info，无额外请求
             pe_ratio = _safe_float(ticker_info.get('trailingPE'))
             pb_ratio = _safe_float(ticker_info.get('priceToBook'))
+            float_shares = _safe_float(ticker_info.get('floatShares'))
+            shares_outstanding = _safe_float(ticker_info.get('sharesOutstanding'))
+            share_base = (
+                float_shares
+                if float_shares is not None and float_shares > 0
+                else (
+                    shares_outstanding
+                    if shares_outstanding is not None and shares_outstanding > 0
+                    else None
+                )
+            )
+            turnover_rate = None
+            if volume is not None and volume > 0 and share_base is not None:
+                raw_turnover = (float(volume) / share_base) * 100.0
+                if 0 < raw_turnover <= 1000.0:
+                    turnover_rate = round(raw_turnover, 2)
+            circ_mv = (
+                round(float(price) * float_shares, 2)
+                if price is not None and price > 0 and float_shares is not None and float_shares > 0
+                else None
+            )
+            held_inst = _safe_float(ticker_info.get('heldPercentInstitutions'))
+            held_insiders = _safe_float(ticker_info.get('heldPercentInsiders'))
+            short_pct_float = _safe_float(ticker_info.get('shortPercentOfFloat'))
+            short_ratio = _safe_float(ticker_info.get('shortRatio'))
+            shares_short_f = _safe_float(ticker_info.get('sharesShort'))
+            ownership_raw = {
+                "held_pct_institutions": (
+                    round(held_inst * 100.0, 2)
+                    if held_inst is not None and 0.0 <= held_inst <= 2.0
+                    else None
+                ),
+                "held_pct_insiders": (
+                    round(held_insiders * 100.0, 2)
+                    if held_insiders is not None and 0.0 <= held_insiders <= 2.0
+                    else None
+                ),
+                "short_pct_float": (
+                    round(short_pct_float * 100.0, 2)
+                    if short_pct_float is not None and 0.0 <= short_pct_float <= 2.0
+                    else None
+                ),
+                "short_ratio": (
+                    round(short_ratio, 2)
+                    if short_ratio is not None and short_ratio >= 0.0
+                    else None
+                ),
+                "shares_short": (
+                    int(shares_short_f)
+                    if shares_short_f is not None and shares_short_f >= 0.0
+                    else None
+                ),
+            }
+            ownership = {k: v for k, v in ownership_raw.items() if v is not None} or None
 
             missing_fields = [
                 field
@@ -1116,7 +1170,7 @@ class YfinanceFetcher(BaseFetcher):
             quote = UnifiedRealtimeQuote(
                 code=quote_code,
                 name=name,
-                source=RealtimeSource.FALLBACK,
+                source=RealtimeSource.YFINANCE,
                 market=suffix_market or ("hk" if _is_hk_market(stock_code) else "us" if is_us_symbol else None),
                 currency=str(ticker_info.get("currency") or "").upper() or None,
                 data_quality="partial" if missing_fields else "ok",
@@ -1127,7 +1181,7 @@ class YfinanceFetcher(BaseFetcher):
                 volume=volume,
                 amount=None,  # yfinance 不直接提供成交额
                 volume_ratio=None,
-                turnover_rate=None,
+                turnover_rate=turnover_rate,
                 amplitude=round(amplitude, 2) if amplitude is not None else None,
                 open_price=open_price,
                 high=high,
@@ -1136,7 +1190,8 @@ class YfinanceFetcher(BaseFetcher):
                 pe_ratio=pe_ratio,
                 pb_ratio=pb_ratio,
                 total_mv=market_cap,
-                circ_mv=None,
+                circ_mv=circ_mv,
+                ownership=ownership,
                 provider_timestamp=provider_timestamp,
                 quote_date=quote_date,
             )

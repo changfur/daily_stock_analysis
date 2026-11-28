@@ -33,6 +33,7 @@ from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
     AnalysisResult,
+    build_offshore_chip_summary,
     fill_price_position_if_needed,
     normalize_chip_structure_availability,
     populate_decision_action_fields,
@@ -759,6 +760,30 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"{log_stock_name}({code}) failed to fetch chip distribution: {e}")
 
+            tw_margin_trading = None
+            if not is_index and get_market_for_stock(normalize_stock_code(code)) == "tw":
+                try:
+                    tw_fetcher = getattr(self.fetcher_manager, "_tw_institutional_fetcher", None)
+                    if tw_fetcher is None:
+                        from data_provider.tw_institutional_fetcher import TwInstitutionalFetcher
+
+                        tw_fetcher = TwInstitutionalFetcher()
+                        self.fetcher_manager._tw_institutional_fetcher = tw_fetcher
+                    tw_margin_trading = tw_fetcher.get_margin_trading(code)
+                    if tw_margin_trading:
+                        logger.info(
+                            "[tw-margin] %s(%s) margin=%d(%+d) short=%d(%+d) lots date=%s",
+                            log_stock_name,
+                            code,
+                            tw_margin_trading.get("margin_balance", 0),
+                            tw_margin_trading.get("margin_change", 0),
+                            tw_margin_trading.get("short_balance", 0),
+                            tw_margin_trading.get("short_change", 0),
+                            tw_margin_trading.get("date", "unknown"),
+                        )
+                except Exception as e:
+                    logger.warning("[tw-margin] %s(%s) fetch failed: %s", log_stock_name, code, e)
+
             # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
             # NOTE: use config.agent_mode (explicit opt-in) instead of
             # config.is_agent_available() so that users who only configured an
@@ -1012,6 +1037,7 @@ class StockAnalysisPipeline:
                 fundamental_context,
                 market_phase_context=market_phase_context_dict,
                 portfolio_context=portfolio_context,
+                tw_margin_trading=tw_margin_trading,
             )
             enhanced_context["market_phase_context"] = market_phase_context_dict
             self._attach_daily_market_context(
@@ -1140,7 +1166,15 @@ class StockAnalysisPipeline:
 
             # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
             if result:
-                normalize_chip_structure_availability(result, chip_data)
+                normalize_chip_structure_availability(
+                    result,
+                    chip_data,
+                    offshore_chip_summary=build_offshore_chip_summary(
+                        enhanced_context,
+                        getattr(result, "report_language", None)
+                        or getattr(self.config, "report_language", "zh"),
+                    ),
+                )
 
             # Step 7.7: price_position fallback
             if result:
@@ -1263,6 +1297,7 @@ class StockAnalysisPipeline:
         fundamental_context: Optional[Dict[str, Any]] = None,
         market_phase_context: Optional[Dict[str, Any]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        tw_margin_trading: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -1290,6 +1325,8 @@ class StockAnalysisPipeline:
             enhanced['stock_name'] = realtime_quote.name
         if isinstance(portfolio_context, dict):
             enhanced["portfolio_context"] = dict(portfolio_context)
+        if isinstance(tw_margin_trading, dict) and tw_margin_trading:
+            enhanced["tw_margin_trading"] = dict(tw_margin_trading)
 
         # 将运行时搜索窗口透传给 analyzer，避免与全局配置重新读取产生窗口不一致
         enhanced['news_window_days'] = getattr(self.search_service, "news_window_days", 3)
@@ -1298,6 +1335,13 @@ class StockAnalysisPipeline:
         if realtime_quote:
             # 使用 getattr 安全获取字段，缺失字段返回 None 或默认值
             volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
+            if (
+                volume_ratio is None
+                and trend_result is not None
+                and getattr(trend_result, 'volume_ratio_5d', None)
+                and float(trend_result.volume_ratio_5d) > 0
+            ):
+                volume_ratio = round(float(trend_result.volume_ratio_5d), 2)
             quote_source = getattr(realtime_quote, 'source', None)
             quote_source_name = getattr(quote_source, 'value', quote_source)
             quote_source_name = str(quote_source_name) if quote_source_name is not None else None
@@ -1313,6 +1357,7 @@ class StockAnalysisPipeline:
                 'total_mv': getattr(realtime_quote, 'total_mv', None),
                 'circ_mv': getattr(realtime_quote, 'circ_mv', None),
                 'change_60d': getattr(realtime_quote, 'change_60d', None),
+                'ownership': getattr(realtime_quote, 'ownership', None),
                 'source': quote_source_name,
                 'fetched_at': getattr(realtime_quote, 'fetched_at', None),
                 'provider_timestamp': getattr(realtime_quote, 'provider_timestamp', None),
@@ -1371,106 +1416,135 @@ class StockAnalysisPipeline:
                 )
                 session_date = str(phase_ctx.get('session_date') or market_today)[:10]
                 orig_today_date = str(orig_today.get('date') or '')[:10] if isinstance(orig_today, dict) else ''
-                if (
-                    session_started
-                    and orig_today_date
-                    and orig_today_date < session_date
-                    and self._is_realtime_quote_for_session(
-                        realtime_quote,
-                        session_date=session_date,
-                        market_tz=market_now.tzinfo,
-                    )
-                ):
-                    enhanced['yesterday'] = dict(orig_today)
-                    yesterday_close = orig_today.get('close')
-                source = getattr(realtime_quote, 'source', None)
-                source_name = getattr(source, 'value', source)
-                source_name = str(source_name) if source_name is not None else 'unknown'
-                open_p = getattr(realtime_quote, 'open_price', None) or getattr(
-                    realtime_quote, 'pre_close', None
-                ) or yesterday_close or orig_today.get('open') or price
-                high_p = getattr(realtime_quote, 'high', None) or price
-                low_p = getattr(realtime_quote, 'low', None) or price
-                vol = getattr(realtime_quote, 'volume', None)
-                amt = getattr(realtime_quote, 'amount', None)
-                pct = getattr(realtime_quote, 'change_pct', None)
-                fetched_at = getattr(realtime_quote, 'fetched_at', None)
-                provider_timestamp = getattr(realtime_quote, 'provider_timestamp', None)
-                fallback_from = getattr(realtime_quote, 'fallback_from', None)
-                realtime_today = {
-                    'close': price,
-                    'open': open_p,
-                    'high': high_p,
-                    'low': low_p,
-                    'ma5': trend_result.ma5,
-                    'ma10': trend_result.ma10,
-                    'ma20': trend_result.ma20,
-                    'date': market_today,
-                    'data_source': f"realtime:{source_name}",
-                    'realtime_source': source_name,
-                    'is_estimated': True,
-                }
-                estimated_fields = [
-                    'close', 'open', 'high', 'low', 'ma5', 'ma10', 'ma20',
-                ]
-                if vol is not None:
-                    realtime_today['volume'] = vol
-                    estimated_fields.append('volume')
-                if amt is not None:
-                    realtime_today['amount'] = amt
-                    estimated_fields.append('amount')
-                if pct is not None:
-                    realtime_today['pct_chg'] = pct
-                    estimated_fields.append('pct_chg')
-                realtime_today['estimated_fields'] = estimated_fields
-                if isinstance(market_phase_context, dict) and "is_partial_bar" in market_phase_context:
-                    realtime_today['is_partial_bar'] = market_phase_context.get("is_partial_bar")
-                if fetched_at is not None:
-                    realtime_today['fetched_at'] = fetched_at
-                if provider_timestamp is not None:
-                    realtime_today['provider_timestamp'] = provider_timestamp
-                if fallback_from is not None:
-                    realtime_today['fallback_from'] = fallback_from
-                realtime_owned_fields = {
-                    'open', 'high', 'low', 'close',
-                    'volume', 'amount', 'pct_chg', 'pctChg',
-                    'date', 'data_source', 'dataSource', 'source',
-                    'realtime_source', 'realtimeSource',
-                    'is_partial_bar', 'isPartialBar', 'is_estimated',
-                    'isEstimated', 'estimated_fields', 'estimatedFields',
-                    'fetched_at', 'fetchedAt', 'provider_timestamp',
-                    'providerTimestamp', 'fallback_from', 'fallbackFrom',
-                }
-                for k, v in orig_today.items():
-                    if k not in realtime_today and k not in realtime_owned_fields and v is not None:
-                        realtime_today[k] = v
-                enhanced['today'] = realtime_today
-                enhanced['ma_status'] = self._compute_ma_status(
-                    price, trend_result.ma5, trend_result.ma10, trend_result.ma20
+                quote_date_str = str(getattr(realtime_quote, 'quote_date', None) or '')[:10]
+                is_non_intraday_phase = (
+                    isinstance(market_phase_context, dict)
+                    and phase_ctx.get('is_partial_bar') is False
+                    and phase_ctx.get('phase') in ('postmarket', 'closed', 'non_trading_day', 'premarket')
                 )
-                enhanced['date'] = market_today
-                if yesterday_close is not None:
-                    try:
-                        yc = float(yesterday_close)
-                        if yc > 0:
-                            enhanced['price_change_ratio'] = round(
-                                (price - yc) / yc * 100, 2
-                            )
-                    except (TypeError, ValueError):
-                        pass
-                if vol is not None and enhanced.get('yesterday'):
-                    yest_vol = enhanced['yesterday'].get('volume') if isinstance(
-                        enhanced['yesterday'], dict
-                    ) else None
-                    if yest_vol is not None:
+                daily_bar_already_finalized = (
+                    is_non_intraday_phase
+                    and isinstance(orig_today, dict)
+                    and orig_today.get('close') is not None
+                    and bool(orig_today_date)
+                    and (
+                        (bool(quote_date_str) and orig_today_date >= quote_date_str)
+                        or (phase_ctx.get('is_trading_day') is False and not quote_date_str)
+                    )
+                )
+                if daily_bar_already_finalized:
+                    finalized_today = dict(orig_today)
+                    finalized_today.setdefault('ma5', trend_result.ma5)
+                    finalized_today.setdefault('ma10', trend_result.ma10)
+                    finalized_today.setdefault('ma20', trend_result.ma20)
+                    enhanced['today'] = finalized_today
+                    enhanced['ma_status'] = self._compute_ma_status(
+                        float(finalized_today['close']),
+                        trend_result.ma5,
+                        trend_result.ma10,
+                        trend_result.ma20,
+                    )
+                else:
+                    if (
+                        session_started
+                        and orig_today_date
+                        and orig_today_date < session_date
+                        and self._is_realtime_quote_for_session(
+                            realtime_quote,
+                            session_date=session_date,
+                            market_tz=market_now.tzinfo,
+                        )
+                    ):
+                        enhanced['yesterday'] = dict(orig_today)
+                        yesterday_close = orig_today.get('close')
+                    source = getattr(realtime_quote, 'source', None)
+                    source_name = getattr(source, 'value', source)
+                    source_name = str(source_name) if source_name is not None else 'unknown'
+                    open_p = getattr(realtime_quote, 'open_price', None) or getattr(
+                        realtime_quote, 'pre_close', None
+                    ) or yesterday_close or orig_today.get('open') or price
+                    high_p = getattr(realtime_quote, 'high', None) or price
+                    low_p = getattr(realtime_quote, 'low', None) or price
+                    vol = getattr(realtime_quote, 'volume', None)
+                    amt = getattr(realtime_quote, 'amount', None)
+                    pct = getattr(realtime_quote, 'change_pct', None)
+                    fetched_at = getattr(realtime_quote, 'fetched_at', None)
+                    provider_timestamp = getattr(realtime_quote, 'provider_timestamp', None)
+                    fallback_from = getattr(realtime_quote, 'fallback_from', None)
+                    realtime_today = {
+                        'close': price,
+                        'open': open_p,
+                        'high': high_p,
+                        'low': low_p,
+                        'ma5': trend_result.ma5,
+                        'ma10': trend_result.ma10,
+                        'ma20': trend_result.ma20,
+                        'date': market_today,
+                        'data_source': f"realtime:{source_name}",
+                        'realtime_source': source_name,
+                        'is_estimated': True,
+                    }
+                    estimated_fields = [
+                        'close', 'open', 'high', 'low', 'ma5', 'ma10', 'ma20',
+                    ]
+                    if vol is not None:
+                        realtime_today['volume'] = vol
+                        estimated_fields.append('volume')
+                    if amt is not None:
+                        realtime_today['amount'] = amt
+                        estimated_fields.append('amount')
+                    if pct is not None:
+                        realtime_today['pct_chg'] = pct
+                        estimated_fields.append('pct_chg')
+                    realtime_today['estimated_fields'] = estimated_fields
+                    if isinstance(market_phase_context, dict) and "is_partial_bar" in market_phase_context:
+                        realtime_today['is_partial_bar'] = market_phase_context.get("is_partial_bar")
+                    if fetched_at is not None:
+                        realtime_today['fetched_at'] = fetched_at
+                    if provider_timestamp is not None:
+                        realtime_today['provider_timestamp'] = provider_timestamp
+                    if fallback_from is not None:
+                        realtime_today['fallback_from'] = fallback_from
+                    realtime_owned_fields = {
+                        'open', 'high', 'low', 'close',
+                        'volume', 'amount', 'pct_chg', 'pctChg',
+                        'date', 'data_source', 'dataSource', 'source',
+                        'realtime_source', 'realtimeSource',
+                        'is_partial_bar', 'isPartialBar', 'is_estimated',
+                        'isEstimated', 'estimated_fields', 'estimatedFields',
+                        'fetched_at', 'fetchedAt', 'provider_timestamp',
+                        'providerTimestamp', 'fallback_from', 'fallbackFrom',
+                    }
+                    for k, v in orig_today.items():
+                        if k not in realtime_today and k not in realtime_owned_fields and v is not None:
+                            realtime_today[k] = v
+                    enhanced['today'] = realtime_today
+                    enhanced['ma_status'] = self._compute_ma_status(
+                        price, trend_result.ma5, trend_result.ma10, trend_result.ma20
+                    )
+                    enhanced['date'] = market_today
+                    if yesterday_close is not None:
                         try:
-                            yv = float(yest_vol)
-                            if yv > 0:
-                                enhanced['volume_change_ratio'] = round(
-                                    float(vol) / yv, 2
+                            yc = float(yesterday_close)
+                            if yc > 0:
+                                enhanced['price_change_ratio'] = round(
+                                    (price - yc) / yc * 100, 2
                                 )
                         except (TypeError, ValueError):
                             pass
+                    if vol is not None and enhanced.get('yesterday'):
+                        yest_vol = enhanced['yesterday'].get('volume') if isinstance(
+                            enhanced['yesterday'], dict
+                        ) else None
+                        if yest_vol is not None:
+                            try:
+                                yv = float(yest_vol)
+                                if yv > 0:
+                                    enhanced['volume_change_ratio'] = round(
+                                        float(vol) / yv, 2
+                                    )
+                            except (TypeError, ValueError):
+                                pass
 
         # ETF/index flag for analyzer prompt (Fixes #274)
         enhanced['is_index_etf'] = SearchService.is_index_or_etf(
@@ -3517,6 +3591,7 @@ class StockAnalysisPipeline:
             metadata={
                 "query_id": query_id,
                 "trigger_source": self.query_source,
+                "chip_not_supported": str(market or "").strip().lower() != "cn",
             },
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
@@ -3567,6 +3642,7 @@ class StockAnalysisPipeline:
             metadata={
                 "query_id": query_id,
                 "trigger_source": self.query_source,
+                "chip_not_supported": str(market or "").strip().lower() != "cn",
             },
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )

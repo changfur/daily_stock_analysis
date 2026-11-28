@@ -956,17 +956,149 @@ def _has_meaningful_chip_data(chip_data: Any) -> bool:
     )
 
 
-def _mark_chip_structure_unavailable(result: "AnalysisResult", language: str) -> None:
+def _format_tw_shares_to_lots(shares: Any, language: str = "zh") -> str:
+    """Format TWSE/TPEx share delta into lots (張 = 1,000 shares) when >= 1 lot, else shares."""
+    try:
+        val = int(shares)
+    except (TypeError, ValueError):
+        return "N/A"
+    if val == 0:
+        return "0 lots" if language == "en" else "0张"
+    if abs(val) >= 1000:
+        lots = round(val / 1000.0)
+        return f"{lots:+,d} lots" if language == "en" else f"{lots:+,d}张"
+    return f"{val:+,d} sh" if language == "en" else f"{val:+,d}股"
+
+
+def build_offshore_chip_summary(
+    context: Optional[Dict[str, Any]],
+    language: str = "zh",
+) -> Optional[str]:
+    """Build a concise chip summary line for non-CN stocks (TW institutional/margin or US ownership)."""
+    if not isinstance(context, dict):
+        return None
+    english = normalize_report_language(language) in ("en", "ko")
+    parts: List[str] = []
+
+    fundamental_context = context.get("fundamental_context")
+    inst_block = (
+        fundamental_context.get("institution", {})
+        if isinstance(fundamental_context, dict)
+        else {}
+    )
+    inst_data = inst_block.get("data", {}) if isinstance(inst_block, dict) else {}
+    if (
+        isinstance(inst_block, dict)
+        and inst_block.get("status") == "ok"
+        and isinstance(inst_data, dict)
+        and all(
+            inst_data.get(k) is not None
+            for k in ("foreign_net", "trust_net", "dealer_net", "total_net")
+        )
+    ):
+        lang_key = "en" if english else "zh"
+        f_txt = _format_tw_shares_to_lots(inst_data["foreign_net"], lang_key)
+        t_txt = _format_tw_shares_to_lots(inst_data["trust_net"], lang_key)
+        d_txt = _format_tw_shares_to_lots(inst_data["dealer_net"], lang_key)
+        tot_txt = _format_tw_shares_to_lots(inst_data["total_net"], lang_key)
+        if english:
+            parts.append(
+                f"3-Institutions total {tot_txt} (Foreign {f_txt} / Trust {t_txt} / Dealer {d_txt})"
+            )
+        else:
+            parts.append(
+                f"三大法人合计 {tot_txt}（外资 {f_txt} / 投信 {t_txt} / 自营 {d_txt}）"
+            )
+
+    tw_margin = context.get("tw_margin_trading")
+    if (
+        isinstance(tw_margin, dict)
+        and tw_margin.get("margin_balance") is not None
+        and tw_margin.get("short_balance") is not None
+    ):
+        m_bal = int(tw_margin["margin_balance"])
+        m_chg = int(tw_margin.get("margin_change") or 0)
+        s_bal = int(tw_margin["short_balance"])
+        s_chg = int(tw_margin.get("short_change") or 0)
+        ratio = tw_margin.get("margin_short_ratio_pct")
+        if english:
+            ratio_txt = f" / Short-Margin {ratio:.2f}%" if ratio is not None else ""
+            parts.append(
+                f"Margin {m_bal:,d} lots ({m_chg:+,d}) / Short {s_bal:,d} lots ({s_chg:+,d}){ratio_txt}"
+            )
+        else:
+            ratio_txt = f" / 券资比 {ratio:.2f}%" if ratio is not None else ""
+            parts.append(
+                f"融资 {m_bal:,d}张({m_chg:+,d}) / 融券 {s_bal:,d}张({s_chg:+,d}){ratio_txt}"
+            )
+
+    if not parts:
+        rt = context.get("realtime")
+        ownership = rt.get("ownership") if isinstance(rt, dict) else None
+        if isinstance(ownership, dict) and ownership:
+            own_parts: List[str] = []
+            if ownership.get("held_pct_institutions") is not None:
+                own_parts.append(
+                    f"Institutions {ownership['held_pct_institutions']:.2f}%"
+                    if english
+                    else f"机构持股 {ownership['held_pct_institutions']:.2f}%"
+                )
+            if ownership.get("held_pct_insiders") is not None:
+                own_parts.append(
+                    f"Insiders {ownership['held_pct_insiders']:.2f}%"
+                    if english
+                    else f"内部人持股 {ownership['held_pct_insiders']:.2f}%"
+                )
+            if ownership.get("short_pct_float") is not None:
+                short_txt = (
+                    f"Short Float {ownership['short_pct_float']:.2f}%"
+                    if english
+                    else f"做空占比 {ownership['short_pct_float']:.2f}%"
+                )
+                if ownership.get("short_ratio") is not None:
+                    short_txt += (
+                        f" ({ownership['short_ratio']:.2f}d cover)"
+                        if english
+                        else f"（回补 {ownership['short_ratio']:.2f}天）"
+                    )
+                own_parts.append(short_txt)
+            elif ownership.get("short_ratio") is not None:
+                own_parts.append(
+                    f"Short Ratio {ownership['short_ratio']:.2f}d"
+                    if english
+                    else f"空单回补 {ownership['short_ratio']:.2f}天"
+                )
+            if own_parts:
+                parts.extend(own_parts)
+
+    if not parts:
+        return None
+    sep = " | " if english else "｜"
+    return sep.join(parts)
+
+
+def _mark_chip_structure_unavailable(
+    result: "AnalysisResult",
+    language: str,
+    reason_override: Optional[str] = None,
+) -> None:
     if not result or not isinstance(result.dashboard, dict):
         return
     data_perspective = result.dashboard.get("data_perspective")
     if not isinstance(data_perspective, dict):
         return
     data_perspective["chip_structure"] = {}
-    data_perspective["chip_unavailable_reason"] = get_chip_unavailable_text(language)
+    data_perspective["chip_unavailable_reason"] = (
+        reason_override if reason_override else get_chip_unavailable_text(language)
+    )
 
 
-def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: Any) -> None:
+def normalize_chip_structure_availability(
+    result: "AnalysisResult",
+    chip_data: Any,
+    *,
+    offshore_chip_summary: Optional[str] = None,
+) -> None:
     """Fill valid chip metrics or collapse placeholder-only chip fields to one fallback line."""
     if not result:
         return
@@ -974,7 +1106,7 @@ def normalize_chip_structure_availability(result: "AnalysisResult", chip_data: A
     if _has_meaningful_chip_data(chip_data):
         fill_chip_structure_if_needed(result, chip_data)
         return
-    _mark_chip_structure_unavailable(result, language)
+    _mark_chip_structure_unavailable(result, language, reason_override=offshore_chip_summary)
 
 
 def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
@@ -4562,7 +4694,11 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
                 result.report_language = report_language
-                normalize_chip_structure_availability(result, context.get("chip"))
+                normalize_chip_structure_availability(
+                    result,
+                    context.get("chip"),
+                    offshore_chip_summary=build_offshore_chip_summary(context, report_language),
+                )
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -4802,13 +4938,18 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         # 添加实时行情数据（量比、换手率等）
         if 'realtime' in context and english:
             rt = context['realtime']
+            turnover_display = (
+                f"{rt['turnover_rate']}%"
+                if rt.get('turnover_rate') is not None
+                else "N/A"
+            )
             prompt += f"""
 ### Realtime Quote Details
 | Indicator | Value | Interpretation |
 |------|------|------|
 | Current Price | {rt.get('price', 'N/A')} | |
 | **Volume Ratio** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **Turnover Rate** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| **Turnover Rate** | **{turnover_display}** | |
 | PE (TTM/dynamic) | {rt.get('pe_ratio', 'N/A')} | |
 | PB | {rt.get('pb_ratio', 'N/A')} | |
 | Total Market Cap | {self._format_amount(rt.get('total_mv'), report_language)} | |
@@ -4817,13 +4958,18 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 """
         elif 'realtime' in context:
             rt = context['realtime']
+            turnover_display = (
+                f"{rt['turnover_rate']}%"
+                if rt.get('turnover_rate') is not None
+                else "N/A"
+            )
             prompt += f"""
 ### 实时行情增强数据
 | 指标 | 数值 | 解读 |
 |------|------|------|
 | 当前价格 | {rt.get('price', 'N/A')} 元 | |
 | **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| **换手率** | **{turnover_display}** | |
 | 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
 | 市净率 | {rt.get('pb_ratio', 'N/A')} | |
 | 总市值 | {self._format_amount(rt.get('total_mv'))} | |
@@ -4973,7 +5119,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             if isinstance(institution_block, dict)
             else {}
         )
-        if (
+        has_tw_institution = bool(
             isinstance(institution_block, dict)
             and institution_block.get("status") == "ok"
             and isinstance(institution_data, dict)
@@ -4981,7 +5127,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 institution_data.get(key) is not None
                 for key in ("foreign_net", "trust_net", "dealer_net", "total_net")
             )
-        ):
+        )
+        if has_tw_institution:
             if english:
                 prompt += f"""
 ### Three Major Institutional Investors (Taiwan chip filter, net buy/sell, unit: shares)
@@ -5007,6 +5154,104 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 资料日期 | {institution_data.get('date', 'N/A')} | 来源 {institution_data.get('source', 'N/A')} |
 
 > 三大法人是台股的筹码过滤器（相当于 A 股主力资金/龙虎榜的角色，但口径不同、不可混用）：外资与投信同向净买支持价格、同向净卖压制价格。请据此判断台股筹码结构，不要在有本数据时写“筹码结构：数据缺失”。
+"""
+
+        # 添加台股融资融券动向（TWSE MI_MARGN / TPEx OpenAPI，单位：张）
+        tw_margin = context.get("tw_margin_trading") if isinstance(context, dict) else None
+        has_tw_margin = bool(
+            isinstance(tw_margin, dict)
+            and tw_margin.get("margin_balance") is not None
+            and tw_margin.get("short_balance") is not None
+        )
+        if has_tw_margin:
+            m_bal = int(tw_margin["margin_balance"])
+            m_chg = int(tw_margin.get("margin_change") or 0)
+            s_bal = int(tw_margin["short_balance"])
+            s_chg = int(tw_margin.get("short_change") or 0)
+            ratio = tw_margin.get("margin_short_ratio_pct")
+            ratio_str = f"{ratio:.2f}%" if ratio is not None else "N/A"
+            offset_val = tw_margin.get("offsetting")
+            offset_str = f"{int(offset_val):,d}" if offset_val is not None else "N/A"
+            m_date = tw_margin.get("date_iso") or tw_margin.get("date") or "N/A"
+            m_src = tw_margin.get("source") or "TWSE/TPEx"
+            if english:
+                prompt += f"""
+### Margin & Short Trading (Taiwan credit trading, unit: lots)
+| Metric | Value | Decision Meaning |
+|------|------|----------|
+| Margin Balance (Change) | {m_bal:,d} ({m_chg:+,d}) | Rising margin reflects retail leverage; falling margin during pullback cleanses chips |
+| Short Balance (Change) | {s_bal:,d} ({s_chg:+,d}) | Rising short balance can reflect hedging or potential short-squeeze fuel |
+| Short-to-Margin Ratio | {ratio_str} | Elevated ratio indicates heavier short positioning |
+| Intraday Offset | {offset_str} | Margin-short intraday offsetting lots |
+| Data Date | {m_date} | Source {m_src} |
+"""
+            else:
+                prompt += f"""
+### 融资融券动向（台股信用交易，单位:张）
+| 指标 | 数值 | 决策含义 |
+|------|------|----------|
+| 融资余额（日增减） | {m_bal:,d} 张（{m_chg:+,d} 张） | 融资大增偏散户杠杆进场，下跌缩资/上涨减资常代表筹码沉淀 |
+| 融券余额（日增减） | {s_bal:,d} 张（{s_chg:+,d} 张） | 融券增加代表空方押注或避险，高券资比时须留意轧空 |
+| 券资比 | {ratio_str} | 融券/融资比例，衡量空方筹码拥挤度 |
+| 资券互抵 | {offset_str} 张 | 当日信用当冲互抵张数 |
+| 资料日期 | {m_date} | 来源 {m_src} |
+"""
+
+        # 添加美股/海外机构持股与做空筹码（来自 yfinance ticker.info，无额外请求）
+        rt_ownership = (
+            context.get("realtime", {}).get("ownership")
+            if isinstance(context, dict) and isinstance(context.get("realtime"), dict)
+            else None
+        )
+        has_offshore_ownership = bool(
+            isinstance(rt_ownership, dict)
+            and any(v is not None for v in rt_ownership.values())
+            and not (has_tw_institution or has_tw_margin)
+        )
+        if has_offshore_ownership:
+            inst_pct = (
+                f"{rt_ownership['held_pct_institutions']:.2f}%"
+                if rt_ownership.get("held_pct_institutions") is not None
+                else "N/A"
+            )
+            insider_pct = (
+                f"{rt_ownership['held_pct_insiders']:.2f}%"
+                if rt_ownership.get("held_pct_insiders") is not None
+                else "N/A"
+            )
+            short_pct = (
+                f"{rt_ownership['short_pct_float']:.2f}%"
+                if rt_ownership.get("short_pct_float") is not None
+                else "N/A"
+            )
+            short_ratio_txt = (
+                f"{rt_ownership['short_ratio']:.2f} days"
+                if english and rt_ownership.get("short_ratio") is not None
+                else (
+                    f"{rt_ownership['short_ratio']:.2f} 天"
+                    if rt_ownership.get("short_ratio") is not None
+                    else "N/A"
+                )
+            )
+            if english:
+                prompt += f"""
+### Institutional Ownership & Short Interest (Offshore Chip Reference)
+| Metric | Value | Decision Meaning |
+|------|------|----------|
+| Institutional Ownership | {inst_pct} | Higher institutional holding reflects stronger institutional anchoring |
+| Insider Ownership | {insider_pct} | Management/insider alignment reference |
+| Short % of Float | {short_pct} | Elevated short float implies bearish crowding or squeeze risk |
+| Days to Cover (Short Ratio) | {short_ratio_txt} | Days of average volume needed to cover short interest |
+"""
+            else:
+                prompt += f"""
+### 机构持股与做空筹码（美股/海外筹码参考）
+| 指标 | 数值 | 决策含义 |
+|------|------|----------|
+| 机构持股比例 | {inst_pct} | 机构持股高代表长线机构锚定度较强 |
+| 内部人持股比例 | {insider_pct} | 管理层与大股东利益绑定参考 |
+| 做空占流通股比例 | {short_pct} | 过高需留意空头拥挤或轧空波动 |
+| 空单回补天数 (Short Ratio) | {short_ratio_txt} | 按日均成交量估算的空单回补天数 |
 """
 
         # 添加筹码分布数据
@@ -5035,6 +5280,28 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
 | 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
 | 筹码状态 | {chip.get('chip_status', unknown_text)} | |
+"""
+        elif has_tw_institution or has_tw_margin:
+            if english:
+                prompt += """
+### Chip Assessment Note
+> A-share CYQ chip distribution is not applicable to Taiwan equities. Base your chip analysis directly on the Three Major Institutional Investors and Margin & Short Trading tables above rather than treating chip signals as missing.
+"""
+            else:
+                prompt += """
+### 筹码口径说明
+> 台股不适用 A 股 CYQ 筹码峰模型，请直接依据上方「三大法人动向」与「融资融券动向」分析筹码结构，勿将筹码判为缺失或不可用。
+"""
+        elif has_offshore_ownership:
+            if english:
+                prompt += """
+### Chip Assessment Note
+> A-share CYQ chip distribution is not applicable to this market. Base your positioning analysis directly on the Institutional Ownership & Short Interest table above rather than treating chip signals as missing.
+"""
+            else:
+                prompt += """
+### 筹码口径说明
+> 美股/海外市场不适用 A 股 CYQ 筹码峰模型，请直接依据上方「机构持股与做空筹码」分析筹码结构，勿将筹码判为缺失或不可用。
 """
         else:
             chip_unavailable_text = get_chip_unavailable_text(report_language)

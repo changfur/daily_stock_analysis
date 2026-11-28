@@ -481,5 +481,86 @@ class TestTwMarketSummary(unittest.TestCase):
             self.assertIsNone(_fetcher().get_market_summary(date="20260101"))
 
 
+MI_MARGN_FIXTURE = {
+    "stat": "OK",
+    "date": "20261127",
+    "tables": [
+        {
+            "title": "115年11月27日 信用交易統計",
+            "fields": ["項目", "買進", "賣出", "現金(券)償還", "前日餘額", "今日餘額"],
+            "data": [["融資(交易單位)", "246,029", "335,093", "12,442", "8,826,426", "8,724,920"]],
+        },
+        {
+            "title": "115年11月27日 融資融券彙總 (全部)",
+            "fields": [
+                "代號", "名稱",
+                "買進", "賣出", "現金償還", "前日餘額", "今日餘額", "次一營業日限額",
+                "買進", "賣出", "現券償還", "前日餘額", "今日餘額", "次一營業日限額",
+                "資券互抵", "註記",
+            ],
+            "data": [
+                ["2330", "台積電", "190", "1,219", "47", "29,267", "28,191", "6,483,092",
+                 "0", "17", "2", "27", "42", "6,483,092", "21", " "],
+            ],
+        },
+    ],
+}
+
+TPEX_MARGIN_FIXTURE = [
+    {
+        "Date": "1151127",
+        "SecuritiesCompanyCode": "6488",
+        "CompanyName": "環球晶",
+        "MarginPurchaseBalancePreviousDay": "8272",
+        "MarginPurchaseBalance": "8116",
+        "ShortSaleBalancePreviousDay": "108",
+        "ShortSaleBalance": "104",
+        "Offsetting": "1",
+    },
+]
+
+
+class TestTwMarginTrading(unittest.TestCase):
+    """Offline tests for TWSE MI_MARGN and TPEx margin balance parsing."""
+
+    def test_twse_margin_parses_and_caches(self):
+        f = _fetcher()
+        with patch("data_provider.tw_institutional_fetcher.requests.get", return_value=_resp(MI_MARGN_FIXTURE)) as mock_get:
+            rec = f.get_margin_trading("2330.TW")
+            rec2 = f.get_margin_trading("2330.TW")
+
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(rec, rec2)
+        self.assertEqual(rec["source"], "TWSE-MI_MARGN")
+        self.assertEqual(rec["date"], "20261127")
+        self.assertEqual(rec["date_iso"], "2026-11-27")
+        self.assertEqual(rec["margin_balance"], 28191)
+        self.assertEqual(rec["margin_change"], -1076)
+        self.assertEqual(rec["short_balance"], 42)
+        self.assertEqual(rec["short_change"], 15)
+        self.assertEqual(rec["margin_short_ratio_pct"], 0.15)
+        self.assertEqual(rec["offsetting"], 21)
+
+    def test_tpex_margin_parses_minguo_date_and_guards_date_mismatch(self):
+        f = _fetcher()
+        with patch("data_provider.tw_institutional_fetcher.requests.get", return_value=_resp(TPEX_MARGIN_FIXTURE)):
+            rec = f.get_margin_trading("6488.TWO")
+            mismatch = f.get_margin_trading("6488.TWO", date="20260101")
+
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["source"], "TPEx-OpenAPI")
+        self.assertEqual(rec["date"], "20261127")
+        self.assertEqual(rec["margin_balance"], 8116)
+        self.assertEqual(rec["margin_change"], -156)
+        self.assertEqual(rec["short_balance"], 104)
+        self.assertEqual(rec["short_change"], -4)
+        self.assertIsNone(mismatch)
+
+    def test_non_tw_and_errors_fail_open_none(self):
+        self.assertIsNone(_fetcher().get_margin_trading("NVDA"))
+        with patch("data_provider.tw_institutional_fetcher.requests.get", return_value=_resp({"stat": "ERROR"})):
+            self.assertIsNone(_fetcher().get_margin_trading("2330.TW"))
+
+
 if __name__ == "__main__":
     unittest.main()
