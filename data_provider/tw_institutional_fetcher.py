@@ -974,13 +974,17 @@ class TwInstitutionalFetcher:
             with self._lock:
                 cached_dates_entry = self._trend_dates_cache.get(dates_cache_key)
                 if cached_dates_entry is not None and (time.time() - cached_dates_entry[0]) < self._cache_ttl:
-                    tables = [
-                        tbl
-                        for ad in cached_dates_entry[1]
-                        if (tbl := self._read_cache((cache_prefix, ad)))
-                    ]
-                    if len(tables) >= 2:
-                        return tables
+                    cached_dates = list(cached_dates_entry[1])
+                else:
+                    cached_dates = None
+            if cached_dates is not None:
+                tables = [
+                    tbl
+                    for ad in cached_dates
+                    if (tbl := self._read_cache((cache_prefix, ad)))
+                ]
+                if len(tables) >= 2:
+                    return tables
 
             collected_tables: List[Dict[str, dict]] = [latest_table]
             collected_dates: List[str] = [latest_ad]
@@ -992,8 +996,12 @@ class TwInstitutionalFetcher:
                 return []
 
             max_lookback = max(days * 3, 14)
+            lookback_deadline = time.time() + 25.0
             for offset in range(1, max_lookback + 1):
                 if len(collected_tables) >= days:
+                    break
+                if time.time() >= lookback_deadline:
+                    logger.info("[tw-trend] %s lookback wall-clock budget reached -> partial stop", kind)
                     break
                 if not self._breaker.is_available(breaker_key):
                     logger.info("[tw-trend] %s circuit OPEN during lookback -> partial stop", breaker_key)

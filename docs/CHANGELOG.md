@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 修复 `TwInstitutionalFetcher._collect_twse_recent_tables` 在多线程并发（`MAX_WORKERS > 1`）二次缓存检查路径中于 `self._lock` 内重入调用 `_read_cache()` 导致的自死锁问题，并补充多线程并发回归测试。
 - [修复] 修复台股（`.TW`/`.TWO`）新闻搜索落入 A 股 `上交所/深交所/cninfo` 查询分支的问题，新增台股专用繁体多维搜索词（自动剥离 `.TW`/`.TWO` 后缀，聚焦重讯、法说会、月营收、外资目标价与除息）并将证交所、柜买中心、公开资讯观测站纳入官方可信来源。
 - [新功能] 台股个股分析免密钥接入证交所/柜买中心官方月营收 OpenAPI（`t187ap05_L` / `mopsfin_t187ap05_O`，全市场一次缓存、ETF 自动跳过），在 Prompt 中注入当月营收、月增率 (MoM)、年增率 (YoY)、累计年增率与官方备注。
 - [新功能] 海外/台美股 `YfinanceFundamentalAdapter` 新增提取即将到来的财报日与除息日（`ticker.calendar`）以及前瞻市盈率 (`forwardPE`)、分析师共识目标价与评级；财报 ≤14 天或除息 ≤7 天时在分析 Prompt 自动附带事件倒数与跳空风险警示。

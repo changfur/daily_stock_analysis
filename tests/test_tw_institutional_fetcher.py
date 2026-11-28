@@ -658,7 +658,49 @@ class TestTwFiveDayTrends(unittest.TestCase):
         self.assertIsNone(f.get_institutional_trend("6488.TWO", days=5))
         self.assertIsNone(f.get_margin_trend("6488.TWO", days=5))
 
+    def test_institutional_5d_trend_concurrent_threads_do_not_deadlock(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import time as _time
+
+        by_date = {
+            None: ("20260626", "5,000"),
+            "20260625": ("20260625", "4,000"),
+            "20260624": ("20260624", "3,000"),
+        }
+
+        def _slow_get(_url, params=None, **_kwargs):
+            _time.sleep(0.05)
+            req_date = (params or {}).get("date")
+            entry = by_date.get(req_date)
+            if entry is None:
+                return _resp({"stat": "很抱歉，沒有符合條件的資料!"})
+            d, f_val = entry
+            payload = copy.deepcopy(T86_FIXTURE)
+            payload["date"] = d
+            payload["data"] = [
+                ["2330", "台積電", "0", "0", f_val, "0", "0", "0", "0", "0", "100", "0", "0", "0", "0", "0", "0", "0", f_val],
+                ["2454", "聯發科", "0", "0", f_val, "0", "0", "0", "0", "0", "100", "0", "0", "0", "0", "0", "0", "0", f_val],
+                ["0050", "元大台灣50", "0", "0", f_val, "0", "0", "0", "0", "0", "100", "0", "0", "0", "0", "0", "0", "0", f_val],
+            ]
+            return _resp(payload)
+
+        f = _fetcher()
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_slow_get):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futs = [
+                    pool.submit(f.get_institutional_trend, code, 3)
+                    for code in ("2330.TW", "2454.TW", "0050.TW")
+                ]
+                results = [fut.result(timeout=5.0) for fut in futs]
+
+        self.assertEqual(len(results), 3)
+        for rec in results:
+            self.assertIsNotNone(rec)
+            self.assertEqual(rec["days"], 3)
+            self.assertEqual(rec["foreign"]["streak"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
