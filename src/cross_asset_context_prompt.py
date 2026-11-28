@@ -114,6 +114,25 @@ def format_cross_asset_context_prompt_section(
 # ---------------------------------------------------------------------------
 # Renderers
 # ---------------------------------------------------------------------------
+_VIX_HIGH_LEVEL = 25.0
+_VIX_EXTREME_LEVEL = 30.0
+
+
+def _extract_vix_value(payload: Mapping[str, Any]) -> Optional[float]:
+    """Safely extract bounded numeric VIX level from untrusted payload."""
+    volatility = payload.get("volatility")
+    if not isinstance(volatility, Mapping):
+        return None
+    for key, item in volatility.items():
+        if str(key).strip().upper().lstrip("^") != "VIX":
+            continue
+        if isinstance(item, Mapping):
+            val = _coerce_bounded_number(item.get("value"))
+            if val is not None and val >= 0:
+                return val
+    return None
+
+
 def _render_zh(
     payload: Dict[str, Any],
     risk_appetite: str,
@@ -144,6 +163,7 @@ def _render_zh(
             zh=True,
         ),
         zh=True,
+        vix_value=_extract_vix_value(payload),
     )
 
 
@@ -175,6 +195,7 @@ def _render_en(
             zh=False,
         ),
         zh=False,
+        vix_value=_extract_vix_value(payload),
     )
 
 
@@ -197,7 +218,13 @@ def _untrusted_body_lines(
     return body
 
 
-def _render_untrusted_block(header: List[str], body_lines: List[str], *, zh: bool) -> str:
+def _render_untrusted_block(
+    header: List[str],
+    body_lines: List[str],
+    *,
+    zh: bool,
+    vix_value: Optional[float] = None,
+) -> str:
     """Wrap sanitized body lines between the UNTRUSTED sentinels.
 
     OR-COR-99c59d92: the line budget applies to the untrusted body ONLY —
@@ -211,11 +238,31 @@ def _render_untrusted_block(header: List[str], body_lines: List[str], *, zh: boo
             "- 约束：外围环境明显偏 risk-off 时，不得直接给出高置信激进买入；"
             "若仍维持该结论，必须在置信度理由中写明例外依据。"
         )
+        if vix_value is not None and vix_value >= _VIX_EXTREME_LEVEL:
+            constraint += (
+                "此外，当前 VIX 已处极端恐慌高位（≥30，接近历史情绪极值区），"
+                "短期波动虽大但也常见恐慌出清与逆向分批布局窗口，请同时提示短期回撤风险与分批观察/反转信号，切忌盲目单边看空。"
+            )
+        elif vix_value is not None and vix_value >= _VIX_HIGH_LEVEL:
+            constraint += (
+                "此外，当前 VIX 已处偏高恐慌区（25–30），请同时评估短期波动风险与情绪高位下的逆向分批观察机会，避免单边机械看空。"
+            )
     else:
         constraint = (
             "- Guardrail: when the external environment is clearly risk-off, avoid high-confidence aggressive buy advice; "
             "if you keep that conclusion, state an explicit exception rationale in the confidence reason."
         )
+        if vix_value is not None and vix_value >= _VIX_EXTREME_LEVEL:
+            constraint += (
+                " Also note VIX is in an extreme panic zone (>=30, near historical fear highs): "
+                "while near-term volatility is elevated, such extremes often coincide with capitulation and staged contrarian watch zones; "
+                "highlight both drawdown risk and reversal/staged-entry signals rather than staying blindly bearish."
+            )
+        elif vix_value is not None and vix_value >= _VIX_HIGH_LEVEL:
+            constraint += (
+                " Also note VIX is in an elevated fear zone (25-30): "
+                "weigh both short-term volatility risk and potential staged contrarian watch opportunities rather than taking a mechanically bearish stance."
+            )
     body_budget = max(_MAX_LINES - len(header) - 3, 1)  # BEGIN + END + constraint
     trimmed = body_lines[:body_budget]
     lines = header + [begin] + trimmed + [end, constraint]

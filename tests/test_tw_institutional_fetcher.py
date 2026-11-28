@@ -6,6 +6,7 @@ Fixtures are trimmed from real TWSE T86 / TPEx OpenAPI responses (captured
 units and buy/sell-net signs — no network is touched.
 """
 
+import copy
 import os
 import sys
 import unittest
@@ -562,5 +563,102 @@ class TestTwMarginTrading(unittest.TestCase):
             self.assertIsNone(_fetcher().get_margin_trading("2330.TW"))
 
 
+class TestTwFiveDayTrends(unittest.TestCase):
+    def test_compute_series_trend_distinguishes_streak_vs_mixed(self):
+        buy_streak = TwInstitutionalFetcher._compute_series_trend([5000, 3000, 1000, -2000, 4000])
+        self.assertEqual(buy_streak["streak"], 3)
+        self.assertEqual(buy_streak["direction"], "consecutive_up")
+        self.assertEqual(buy_streak["cumulative"], 11000)
+        self.assertEqual(buy_streak["positive_days"], 4)
+        self.assertEqual(buy_streak["negative_days"], 1)
+
+        sell_streak = TwInstitutionalFetcher._compute_series_trend([-100, -200, 50, 100, 200])
+        self.assertEqual(sell_streak["streak"], -2)
+        self.assertEqual(sell_streak["direction"], "consecutive_down")
+
+        mixed = TwInstitutionalFetcher._compute_series_trend([1000, -500, 800, -300, -200])
+        self.assertEqual(mixed["streak"], 1)
+        self.assertEqual(mixed["direction"], "mixed")
+        self.assertEqual(mixed["positive_days"], 2)
+        self.assertEqual(mixed["negative_days"], 3)
+        self.assertEqual(mixed["cumulative"], 800)
+
+    def test_institutional_5d_trend_skips_holidays_and_reuses_cache_across_stocks(self):
+        by_date = {
+            None: ("20260626", "5,000", "1,000", "200", "6,200"),
+            "20260625": ("20260625", "4,000", "-500", "100", "3,600"),
+            "20260624": None,  # holiday -> stat!=OK
+            "20260623": ("20260623", "3,000", "200", "-100", "3,100"),
+            "20260622": ("20260622", "-1,000", "300", "50", "-650"),
+            "20260619": ("20260619", "2,000", "100", "0", "2,100"),
+        }
+
+        def _fake_get(_url, params=None, **_kwargs):
+            req_date = (params or {}).get("date")
+            entry = by_date.get(req_date)
+            if entry is None:
+                return _resp({"stat": "很抱歉，沒有符合條件的資料!"})
+            d, f_val, t_val, d_val, tot_val = entry
+            payload = copy.deepcopy(T86_FIXTURE)
+            payload["date"] = d
+            payload["data"] = [
+                ["2330", "台積電", "0", "0", f_val, "0", "0", "0", "0", "0", t_val, d_val, "0", "0", "0", "0", "0", "0", tot_val],
+                ["2454", "聯發科", "0", "0", "-1,000", "0", "0", "0", "0", "0", "500", "0", "0", "0", "0", "0", "0", "0", "-500"],
+            ]
+            return _resp(payload)
+
+        f = _fetcher()
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_fake_get) as mock_get:
+            trend_2330 = f.get_institutional_trend("2330.TW", days=5)
+            calls_after_first = mock_get.call_count
+            trend_2454 = f.get_institutional_trend("2454.TW", days=5)
+            calls_after_second = mock_get.call_count
+
+        self.assertIsNotNone(trend_2330)
+        self.assertEqual(trend_2330["days"], 5)
+        self.assertEqual(trend_2330["foreign"]["streak"], 3)
+        self.assertEqual(trend_2330["foreign"]["cumulative"], 13000)
+        self.assertEqual(trend_2330["trust"]["direction"], "mixed")
+
+        self.assertIsNotNone(trend_2454)
+        self.assertEqual(trend_2454["foreign"]["streak"], -5)
+        # Second TWSE stock must reuse whole-market cache with ZERO extra HTTP requests.
+        self.assertEqual(calls_after_first, calls_after_second)
+
+    def test_margin_5d_trend_and_tpex_fail_open(self):
+        by_date = {
+            None: ("20261127", "28,500", "28,600", "50", "45"),
+            "20261126": ("20261126", "28,400", "28,500", "48", "50"),
+            "20261125": ("20261125", "28,550", "28,400", "52", "48"),
+        }
+
+        def _fake_get(_url, params=None, **_kwargs):
+            req_date = (params or {}).get("date")
+            entry = by_date.get(req_date)
+            if entry is None:
+                return _resp({"stat": "很抱歉，沒有符合條件的資料!"})
+            d, mp, mc, sp, sc = entry
+            payload = copy.deepcopy(MI_MARGN_FIXTURE)
+            payload["date"] = d
+            payload["tables"][-1]["data"] = [
+                ["2330", "台積電", "0", "0", "0", mp, mc, "0", "0", "0", "0", sp, sc, "0", "10", ""],
+            ]
+            return _resp(payload)
+
+        f = _fetcher()
+        with patch("data_provider.tw_institutional_fetcher.requests.get", side_effect=_fake_get):
+            m_trend = f.get_margin_trend("2330.TW", days=3)
+
+        self.assertIsNotNone(m_trend)
+        self.assertEqual(m_trend["days"], 3)
+        self.assertEqual(m_trend["margin"]["streak"], 2)  # +100, +100, -150
+        self.assertEqual(m_trend["margin"]["cumulative"], 50)
+        self.assertEqual(m_trend["short"]["direction"], "mixed")  # -5, +2, -4
+        # TPEx OpenAPI has no historical date param -> fail-open None
+        self.assertIsNone(f.get_institutional_trend("6488.TWO", days=5))
+        self.assertIsNone(f.get_margin_trend("6488.TWO", days=5))
+
+
 if __name__ == "__main__":
     unittest.main()
+

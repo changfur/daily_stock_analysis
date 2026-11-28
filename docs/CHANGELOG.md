@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 台股上市标的（`.TW`）新增近 5 日三大法人买卖超与融资融券滚动趋势（区分连续买/卖超天数与震荡分歧「无连续方向」，全市场单日缓存跨股票复用；上柜 `.TWO` 无历史日期参数时安全 fail-open 回退单日数据）。
+- [新功能] 新增台股与美股 ADR 双挂牌折溢价计算（`data_provider/tw_adr_premium.py`，覆盖 `2330.TW↔TSM`、`2303.TW↔UMC`、`3711.TW↔ASX`、`2412.TW↔CHT`），基于实时/最新收盘与 `TWD=X` 汇率换算等值台币价及折溢价幅度，并提示台美收盘时差与台积电 ADR 结构性溢价特性。
+- [改进] 补齐台股 `00xxxx.TW`/`.TWO` ETF 识别与杠杆/反向型 ETF 识别（如 `0050.TW`、`00631L.TW`、`00632R.TW`、`TQQQ`、`SOXL`）；ETF 分析 Prompt 跳过无意义的个股财报与分红空表，杠杆/反向型 ETF 自动附加每日再平衡波动耗损与期货基差风险警示。
+- [改进] 跨资产宏观看板 Prompt 在 VIX 处于偏高恐慌区（25–30）或极端恐慌高位（≥30）时补充平衡性约束：除提示短期波动风险外，同时关注情绪高位下的恐慌出清与逆向分批观察机会。
+- [改进] GitHub Actions 每日分析工作流（`00-daily-analysis.yml`）拆分为美股早报（UTC 22:37 / 台北 06:37）与台股午后报（UTC 08:07 / 台北 16:07）并按 `STOCK_LIST` 自动分流、支持手动 `market_scope` 选择；默认启用跨资产环境（`CROSS_ASSET_CONTEXT_ENABLED=true`）与 3 次历史对比（`REPORT_HISTORY_COMPARE_N=3`），并新增 `data/stock_analysis.db` Actions Cache 持久化与 90 天自动清理瘦身。
 - [新功能] 台股个股分析接入 TWSE `MI_MARGN` 与 TPEx `tpex_mainboard_margin_balance` 免密钥开放资料，补充融资/融券余额与日增减、券资比与资券互抵，并与三大法人汇总为台股筹码摘要；美股复用 `yfinance` `ticker.info` 补充机构持股、内部人持股、做空占流通股比例与空单回补天数，消除台美股报告中误导性的 A 股 CYQ「筹码分布未启用」提示。
 - [改进] 补齐美股/台股/海外个股量比（实时缺失时回退至 5 日量比 `volume_ratio_5d`）与换手率（基于 `floatShares`/`sharesOutstanding` 计算），并修复无换手率标的（如 ETF）在通知中拼接多余 `%` 的显示问题。
 - [修复] `YfinanceFetcher` 正常行情改为 `RealtimeSource.YFINANCE`（不再误标为 `quote: fallback`），收市后日线已定稿时不再覆盖为 `is_estimated`（消除误判 `technical: partial`），并为非 A 股市场将 A 股 CYQ 标记为 `chip_not_supported`。

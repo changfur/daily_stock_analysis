@@ -25,11 +25,12 @@ Units are **shares (股)**, not lots (張). Buy/sell-net signs are preserved
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import logging
 import re
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -152,6 +153,9 @@ class TwInstitutionalFetcher:
         # open, instead of paying timeout + throttle on every stock during an outage.
         # Reuses the repo's CircuitBreaker (same one DataFetcherManager uses).
         self._breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
+        # Cached list of recent valid TWSE trading dates keyed by (kind, latest_ad, days)
+        # so multi-stock runs discover holidays once and reuse whole-market tables.
+        self._trend_dates_cache: Dict[Any, Tuple[float, List[str]]] = {}
 
     # ------------------------------------------------------------------ public
     def get_institutional_net(
@@ -873,5 +877,213 @@ class TwInstitutionalFetcher:
         if offsetting is not None:
             rec["offsetting"] = offsetting
         return rec
+
+    # ---------------------------------------- TWSE multi-day rolling chip trend
+    @staticmethod
+    def _compute_series_trend(values_newest_first: List[int]) -> Dict[str, Any]:
+        """Compute cumulative total, up/down day counts, and consecutive streak from newest-first series."""
+        cumulative = sum(values_newest_first)
+        positive_days = sum(1 for v in values_newest_first if v > 0)
+        negative_days = sum(1 for v in values_newest_first if v < 0)
+        flat_days = len(values_newest_first) - positive_days - negative_days
+
+        streak = 0
+        if values_newest_first:
+            first = values_newest_first[0]
+            if first > 0:
+                for v in values_newest_first:
+                    if v > 0:
+                        streak += 1
+                    else:
+                        break
+            elif first < 0:
+                for v in values_newest_first:
+                    if v < 0:
+                        streak -= 1
+                    else:
+                        break
+
+        if streak >= 2:
+            direction = "consecutive_up"
+        elif streak <= -2:
+            direction = "consecutive_down"
+        else:
+            direction = "mixed"
+
+        return {
+            "cumulative": cumulative,
+            "positive_days": positive_days,
+            "negative_days": negative_days,
+            "flat_days": flat_days,
+            "streak": streak,
+            "direction": direction,
+        }
+
+    def _collect_twse_recent_tables(
+        self,
+        *,
+        kind: str,
+        cache_prefix: str,
+        breaker_key: str,
+        fetch_table: Callable[[Optional[str]], Dict[str, dict]],
+        days: int,
+    ) -> List[Dict[str, dict]]:
+        """Collect up to ``days`` newest-first TWSE whole-market tables, caching discovered trading dates."""
+        if days < 2:
+            return []
+        try:
+            latest_table = fetch_table(None)
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            logger.info("[tw-trend] latest %s table fetch failed: %s", kind, exc)
+            return []
+        if not latest_table:
+            return []
+
+        first_rec = next(iter(latest_table.values()), None)
+        latest_ad = self._norm_ad_date(first_rec.get("date")) if isinstance(first_rec, dict) else None
+        if not latest_ad:
+            return []
+
+        # Seed the explicit-date cache with the latest table so lookups by date never re-fetch it.
+        with self._lock:
+            latest_key = (cache_prefix, latest_ad)
+            if latest_key not in self._cache:
+                self._cache[latest_key] = latest_table
+                self._cache_at[latest_key] = time.time()
+
+        dates_cache_key = (kind, latest_ad, days)
+        with self._lock:
+            cached_dates_entry = self._trend_dates_cache.get(dates_cache_key)
+            if cached_dates_entry is not None and (time.time() - cached_dates_entry[0]) < self._cache_ttl:
+                cached_dates = list(cached_dates_entry[1])
+            else:
+                cached_dates = None
+
+        if cached_dates is not None:
+            tables: List[Dict[str, dict]] = []
+            for ad in cached_dates:
+                tbl = self._read_cache((cache_prefix, ad))
+                if tbl:
+                    tables.append(tbl)
+            if len(tables) >= 2:
+                return tables
+
+        with self._key_lock(("twse_trend_dates", kind, latest_ad, days)):
+            with self._lock:
+                cached_dates_entry = self._trend_dates_cache.get(dates_cache_key)
+                if cached_dates_entry is not None and (time.time() - cached_dates_entry[0]) < self._cache_ttl:
+                    tables = [
+                        tbl
+                        for ad in cached_dates_entry[1]
+                        if (tbl := self._read_cache((cache_prefix, ad)))
+                    ]
+                    if len(tables) >= 2:
+                        return tables
+
+            collected_tables: List[Dict[str, dict]] = [latest_table]
+            collected_dates: List[str] = [latest_ad]
+            seen_dates = {latest_ad}
+
+            try:
+                cursor = datetime.strptime(latest_ad, "%Y%m%d").date()
+            except ValueError:
+                return []
+
+            max_lookback = max(days * 3, 14)
+            for offset in range(1, max_lookback + 1):
+                if len(collected_tables) >= days:
+                    break
+                if not self._breaker.is_available(breaker_key):
+                    logger.info("[tw-trend] %s circuit OPEN during lookback -> partial stop", breaker_key)
+                    break
+                cand_date = cursor - timedelta(days=offset)
+                if cand_date.weekday() >= 5:
+                    continue
+                cand_ad = cand_date.strftime("%Y%m%d")
+                try:
+                    tbl = fetch_table(cand_ad)
+                except Exception as exc:  # noqa: BLE001 - fail-open
+                    logger.info("[tw-trend] %s lookback %s failed: %s", kind, cand_ad, exc)
+                    continue
+                if not tbl:
+                    continue
+                sample = next(iter(tbl.values()), None)
+                served_ad = self._norm_ad_date(sample.get("date")) if isinstance(sample, dict) else cand_ad
+                if not served_ad or served_ad in seen_dates:
+                    continue
+                seen_dates.add(served_ad)
+                collected_dates.append(served_ad)
+                collected_tables.append(tbl)
+                with self._lock:
+                    self._cache[(cache_prefix, served_ad)] = tbl
+                    self._cache_at[(cache_prefix, served_ad)] = time.time()
+
+            if len(collected_dates) >= 2:
+                with self._lock:
+                    self._trend_dates_cache[dates_cache_key] = (time.time(), list(collected_dates))
+            return collected_tables
+
+    def get_institutional_trend(
+        self, stock_code: str, days: int = 5
+    ) -> Optional[dict]:
+        """Return multi-day rolling 三大法人 trend for a TWSE (.TW) stock, or ``None``.
+
+        TPEx OpenAPI only serves the latest day without a historical date parameter,
+        so ``.TWO`` stocks fail open to ``None`` (single-day data still applies).
+        """
+        if self._market_of(stock_code) != "twse" or days < 2:
+            return None
+        base = self._base_code(stock_code)
+        tables = self._collect_twse_recent_tables(
+            kind="inst",
+            cache_prefix="twse",
+            breaker_key="twse",
+            fetch_table=lambda d: self._whole_market("twse", d),
+            days=days,
+        )
+        records = [tbl[base] for tbl in tables if base in tbl]
+        if len(records) < 2:
+            return None
+        return {
+            "stock_code": base,
+            "market": "上市",
+            "source": "TWSE-T86",
+            "unit": "shares",
+            "days": len(records),
+            "dates": [r["date"] for r in records],
+            "foreign": self._compute_series_trend([int(r["foreign_net"]) for r in records]),
+            "trust": self._compute_series_trend([int(r["trust_net"]) for r in records]),
+            "dealer": self._compute_series_trend([int(r["dealer_net"]) for r in records]),
+            "total": self._compute_series_trend([int(r["total_net"]) for r in records]),
+        }
+
+    def get_margin_trend(
+        self, stock_code: str, days: int = 5
+    ) -> Optional[dict]:
+        """Return multi-day rolling 融資融券 trend (unit: lots) for a TWSE (.TW) stock, or ``None``."""
+        if self._market_of(stock_code) != "twse" or days < 2:
+            return None
+        base = self._base_code(stock_code)
+        tables = self._collect_twse_recent_tables(
+            kind="margin",
+            cache_prefix="twse_margin",
+            breaker_key="twse_margin",
+            fetch_table=lambda d: self._whole_market_margin("twse", d),
+            days=days,
+        )
+        records = [tbl[base] for tbl in tables if base in tbl]
+        if len(records) < 2:
+            return None
+        return {
+            "stock_code": base,
+            "market": "上市",
+            "source": "TWSE-MI_MARGN",
+            "unit": "lots",
+            "days": len(records),
+            "dates": [r["date"] for r in records],
+            "margin": self._compute_series_trend([int(r["margin_change"]) for r in records]),
+            "short": self._compute_series_trend([int(r["short_change"]) for r in records]),
+        }
+
 
 

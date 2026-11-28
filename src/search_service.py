@@ -2845,6 +2845,17 @@ class SearchService:
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
     _ETF_NAME_KEYWORDS = ('ETF', 'FUND', 'TRUST', 'INDEX', 'TRACKER', 'UNIT')  # US/HK ETF name hints
+    _TW_ETF_CODE_RE = re.compile(r'^00\d{2,4}[A-Z]?$')
+    _TW_LEVERAGED_INVERSE_RE = re.compile(r'^00\d{2,4}[LR]$')
+    _LEVERAGED_ETF_SYMBOLS = frozenset({
+        'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'UPRO', 'SPXU', 'QLD', 'QID',
+        'SDS', 'SSO', 'TNA', 'TZA', 'UVXY', 'SVXY', 'NVDL', 'NVDX',
+        'NVDS', 'TSLL', 'TSLQ', 'CONL', 'MSTU', 'MSTX',
+    })
+    _LEVERAGED_ETF_NAME_KEYWORDS = (
+        '正2', '正3', '反1', '反2', '2X', '3X', '-1X', '-2X', '-3X',
+        'LEVERAGED', 'INVERSE', 'ULTRAPRO', 'PROSHARES ULTRA', 'DIREXION DAILY',
+    )
 
     @staticmethod
     def is_index_or_etf(stock_code: str, stock_name: str) -> bool:
@@ -2852,9 +2863,16 @@ class SearchService:
         Judge if symbol is index-tracking ETF or market index.
         For such symbols, analysis focuses on index movement only, not issuer company risks.
         """
-        code = (stock_code or '').strip().split('.')[0]
+        raw_upper = (stock_code or '').strip().upper()
+        code = raw_upper.split('.')[0]
         if not code:
             return False
+        # Taiwan ETF (TWSE .TW / TPEx .TWO codes starting with 00, e.g. 0050.TW, 00631L.TW, 00679B.TWO)
+        if (raw_upper.endswith('.TW') or raw_upper.endswith('.TWO')) and SearchService._TW_ETF_CODE_RE.match(code):
+            return True
+        # Known US leveraged/inverse ETFs
+        if code in SearchService._LEVERAGED_ETF_SYMBOLS:
+            return True
         # A-share ETF
         if code.isdigit() and len(code) == 6 and code.startswith(SearchService._A_ETF_PREFIXES):
             return True
@@ -2865,6 +2883,22 @@ class SearchService:
         if SearchService._is_foreign_stock(code):
             name_upper = (stock_name or '').upper()
             return any(kw in name_upper for kw in SearchService._ETF_NAME_KEYWORDS)
+        return False
+
+    @staticmethod
+    def is_leveraged_or_inverse_etf(stock_code: str, stock_name: str) -> bool:
+        """Judge if symbol is a leveraged or inverse ETF subject to daily-reset volatility drag."""
+        raw_upper = (stock_code or '').strip().upper()
+        code = raw_upper.split('.')[0]
+        if not code:
+            return False
+        if (raw_upper.endswith('.TW') or raw_upper.endswith('.TWO')) and SearchService._TW_LEVERAGED_INVERSE_RE.match(code):
+            return True
+        if code in SearchService._LEVERAGED_ETF_SYMBOLS:
+            return True
+        if SearchService.is_index_or_etf(stock_code, stock_name):
+            name_upper = (stock_name or '').upper()
+            return any(kw in name_upper for kw in SearchService._LEVERAGED_ETF_NAME_KEYWORDS)
         return False
 
     @property

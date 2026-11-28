@@ -353,3 +353,42 @@ class TestSentinelEscapingOfTagsAndKeys:
 
         assert section.count("END_UNTRUSTED_CROSS_ASSET_SUMMARY") == 1
         assert r"END\_UNTRUSTED\_CROSS\_ASSET\_SUMMARY" in section
+
+
+class TestVixContrarianGuidance:
+    def test_vix_elevated_adds_balanced_contrarian_hint_zh_and_en(self):
+        zh = format_cross_asset_context_prompt_section(_context(), report_language="zh")
+        assert "偏高恐慌区（25–30）" in zh
+        assert "逆向分批观察" in zh
+        assert zh.splitlines()[-2] == "- END_UNTRUSTED_CROSS_ASSET_SUMMARY"
+        assert len(zh.splitlines()) <= 19
+
+        en = format_cross_asset_context_prompt_section(_context(), report_language="en")
+        assert "elevated fear zone (25-30)" in en
+        assert "contrarian" in en
+        assert en.splitlines()[-2] == "- END_UNTRUSTED_CROSS_ASSET_SUMMARY"
+
+    def test_vix_extreme_adds_historical_panic_window_hint(self):
+        ctx = {
+            "risk_appetite": "risk_off",
+            "impact_summary": "VIX spiked",
+            "volatility": {"^VIX": {"value": 34.8, "change_pct": 18.5}},
+        }
+        zh = format_cross_asset_context_prompt_section(ctx, report_language="zh")
+        assert "极端恐慌高位（≥30" in zh
+        assert "恐慌出清" in zh
+
+        en = format_cross_asset_context_prompt_section(ctx, report_language="en")
+        assert "extreme panic zone (>=30" in en
+        assert "capitulation" in en
+
+    def test_vix_normal_does_not_add_panic_hint(self):
+        ctx = {
+            "risk_appetite": "neutral",
+            "impact_summary": "calm market",
+            "volatility": {"VIX": {"value": 16.2, "change_pct": -1.0}},
+        }
+        zh = format_cross_asset_context_prompt_section(ctx, report_language="zh")
+        assert "恐慌高位" not in zh
+        assert "偏高恐慌区" not in zh
+

@@ -1,9 +1,10 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间/台湾时间 16:07 (UTC 08:07，台股三大法人公布后且避开整点拥堵)
+  # 定时触发（美股早报 + 台股午后报，拆开执行互不拖累且各有最佳资料时效）
   schedule:
-    - cron: '7 8 * * 1-5'     # 周一到周五，UTC 08:07 = 北京/台湾时间 16:07
+    - cron: '37 22 * * 1-5'   # 周一到周五 UTC 22:37 = 台北/北京 周二到周六 06:37（美股收盘后）
+    - cron: '7 8 * * 1-5'     # 周一到周五 UTC 08:07 = 台北/北京 周一到周五 16:07（台股三大法人与融资融券公布后）
   
   # 手动触发
   workflow_dispatch:
@@ -17,6 +18,15 @@ on:
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+      market_scope:
+        description: '分析市场范围（自动按 STOCK_LIST 筛选）'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all           # 全部自选股
+          - tw            # 仅台股（.TW/.TWO + 台股大盘）
+          - us            # 仅美股/非台股（+ 美股大盘）
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -59,6 +69,14 @@ jobs:
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
+
+      - name: 恢复/保存历史分析数据库缓存
+        uses: actions/cache@v4
+        with:
+          path: data/stock_analysis.db
+          key: stock-analysis-db-${{ github.run_id }}
+          restore-keys: |
+            stock-analysis-db-
       
       - name: 执行股票分析
         env:
@@ -445,6 +463,8 @@ jobs:
           REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'simple' }}
           REPORT_LANGUAGE: ${{ vars.REPORT_LANGUAGE || secrets.REPORT_LANGUAGE || '' }}
           REPORT_SHOW_LLM_MODEL: ${{ vars.REPORT_SHOW_LLM_MODEL || secrets.REPORT_SHOW_LLM_MODEL || 'true' }}
+          REPORT_HISTORY_COMPARE_N: ${{ vars.REPORT_HISTORY_COMPARE_N || secrets.REPORT_HISTORY_COMPARE_N || '3' }}
+          CROSS_ASSET_CONTEXT_ENABLED: ${{ vars.CROSS_ASSET_CONTEXT_ENABLED || secrets.CROSS_ASSET_CONTEXT_ENABLED || 'true' }}
           SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
@@ -474,6 +494,30 @@ jobs:
             export STOCK_LIST="600519"
           fi
 
+          # 判断运行模式与市场范围（定时任务按美股早报/台股午后报自动拆单，手动触发可自选）
+          MODE="${{ github.event.inputs.mode || 'full' }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "37 22 * * 1-5" ]; then
+              MARKET_SCOPE="us"
+            elif [ "${{ github.event.schedule }}" = "7 8 * * 1-5" ]; then
+              MARKET_SCOPE="tw"
+            else
+              MARKET_SCOPE="all"
+            fi
+          else
+            MARKET_SCOPE="${{ github.event.inputs.market_scope || 'all' }}"
+          fi
+
+          if [ "$MARKET_SCOPE" = "tw" ] || [ "$MARKET_SCOPE" = "us" ]; then
+            FILTERED_STOCK_LIST="$(python -c 'import sys; raw, scope = sys.argv[1], sys.argv[2]; toks = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]; kept = [t for t in toks if t.upper().endswith((".TW", ".TWO"))] if scope == "tw" else [t for t in toks if not t.upper().endswith((".TW", ".TWO"))]; print(",".join(kept))' "$STOCK_LIST" "$MARKET_SCOPE")"
+            export STOCK_LIST="$FILTERED_STOCK_LIST"
+            export MARKET_REVIEW_REGION="$MARKET_SCOPE"
+            if [ "$MODE" != "market-only" ] && [ -z "$STOCK_LIST" ]; then
+              echo "ℹ️ 当前市场范围 ($MARKET_SCOPE) 在 STOCK_LIST 中无匹配标的，跳过本次分析"
+              exit 0
+            fi
+          fi
+
           # 处理 LITELLM YAML 配置文件
           if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
             echo "📝 使用 GitHub Actions Secrets/Variables 中的 LITELLM_CONFIG_YAML 配置"
@@ -483,17 +527,14 @@ jobs:
             echo "$LITELLM_CONFIG_YAML" > "$LITELLM_CONFIG"
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
-
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
           
           echo "=========================================="
-          echo "🚀 A股自选股智能分析系统"
+          echo "🚀 自选股智能分析系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
-          echo "🎯 运行模式: $MODE"
+          echo "🎯 运行模式: $MODE | 市场范围: $MARKET_SCOPE | 大盘区域: $MARKET_REVIEW_REGION"
           echo "📊 自选股: $STOCK_LIST"
-          echo "📝 报告类型: $REPORT_TYPE"
+          echo "📝 报告类型: $REPORT_TYPE | 历史对比: $REPORT_HISTORY_COMPARE_N | 跨资产环境: $CROSS_ASSET_CONTEXT_ENABLED"
           echo ""
           echo "=========================================="
           echo "📋 配置检查"
@@ -581,6 +622,55 @@ jobs:
           else
             python main.py $FORCE_RUN_ARG
           fi
+
+      - name: 清理过期历史数据库记录（保留 90 天）
+        if: always()
+        run: |
+          python - << 'PY'
+          import os, sqlite3
+          from datetime import datetime, timedelta
+
+          db_path = "data/stock_analysis.db"
+          if not os.path.isfile(db_path):
+              print("ℹ️ No SQLite DB found, skip pruning")
+              raise SystemExit(0)
+
+          try:
+              conn = sqlite3.connect(db_path)
+              cur = conn.cursor()
+              existing = {
+                  row[0]
+                  for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+              }
+              cutoff_90 = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+              cutoff_120_date = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
+              rules = [
+                  ("analysis_history", "created_at", cutoff_90),
+                  ("news_intel", "fetched_at", cutoff_90),
+                  ("fundamental_snapshot", "created_at", cutoff_90),
+                  ("llm_usage", "called_at", cutoff_90),
+                  ("market_sentiment_snapshots", "created_at", cutoff_90),
+                  ("stock_daily", "date", cutoff_120_date),
+              ]
+              total_deleted = 0
+              for table, col, cutoff in rules:
+                  if table not in existing:
+                      continue
+                  cols = {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+                  if col not in cols:
+                      continue
+                  cur.execute(f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?", (cutoff,))
+                  deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                  total_deleted += deleted
+              conn.commit()
+              if total_deleted > 0:
+                  cur.execute("VACUUM")
+              conn.close()
+              size_mb = os.path.getsize(db_path) / (1024 * 1024)
+              print(f"🧹 SQLite retention prune complete: deleted={total_deleted} rows, db_size={size_mb:.2f} MB")
+          except Exception as exc:
+              print(f"⚠️ SQLite retention prune skipped (fail-open): {exc}")
+          PY
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6

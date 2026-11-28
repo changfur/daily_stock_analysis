@@ -109,9 +109,10 @@ PY
 - 报告 Prompt 已增加台股市场语义（新台币、三大法人、TWSE/TPEx ±10% 涨跌停），并将三大法人净买卖超注入 LLM 分析上下文，避免套用 A 股北向资金、龙虎榜等概念。
 - 交易日历注册 `tw: XTAI / Asia/Taipei`。TWSE 为 09:00–13:30 连续交易、无午休；收盘集合竞价 13:25–13:30 已按 5 分钟启发式窗口建模（`_CLOSING_AUCTION_WINDOW_MINUTES["tw"]=5`，`market_phase` 可返回 `closing_auction`）。JP/KR 也已按常规交易时段补齐收盘集合竞价窗口（JP 15:25-15:30、KR 15:20-15:30）。若本地 `exchange-calendars` 版本缺少对应日历，既有 fail-open/fail-closed 语义保持不变。
 - 主要指数提供加权指数 `^TWII` 与柜买指数 `TWOII`（优先尝试 Yahoo Finance `^TWOII`，不可用时自动回退至柜买中心 TPEx OpenAPI `tpex_index`）。
-- 三大法人买卖超（institutional flows）与融资融券（margin trading）资料层：`TwInstitutionalFetcher`（`data_provider/tw_institutional_fetcher.py`）提供上市（TWSE T86 / `MI_MARGN`）/ 上柜（TPEx OpenAPI `tpex_3insti_daily_trading` / `tpex_mainboard_margin_balance`）每日外资·投信·自营商·三大法人买卖超（单位：**股数**）及个股融资余额/增减、融券余额/增减、券资比与资券互抵（单位：**张**），均按日期+市场做单日全市场缓存再过滤个股。接口失败/限流/空响应/字段缺失一律 **fail-open** 返回无数据，不中断分析；仅对 `.TW`/`.TWO` 生效。资料来源为政府开放资料，采「政府资料开放授权条款第 1 版」(OGDL v1，允许商用与再散布，需标示来源)。
+- 三大法人买卖超（institutional flows）与融资融券（margin trading）资料层：`TwInstitutionalFetcher`（`data_provider/tw_institutional_fetcher.py`）提供上市（TWSE T86 / `MI_MARGN`）/ 上柜（TPEx OpenAPI `tpex_3insti_daily_trading` / `tpex_mainboard_margin_balance`）每日外资·投信·自营商·三大法人买卖超（单位：**股数**）及个股融资余额/增减、融券余额/增减、券资比与资券互抵（单位：**张**），上市标的（`.TW`）进一步提供近 5 个交易日滚动累计与连续天数趋势（明确区分连续方向与震荡分歧「无连续方向」，全市场单日缓存跨股票复用；上柜 `.TWO` 因 OpenAPI 无历史日期参数自动 fail-open 回退单日数据）。接口失败/限流/空响应/字段缺失一律 **fail-open** 返回无数据，不中断分析；仅对 `.TW`/`.TWO` 生效。资料来源为政府开放资料，采「政府资料开放授权条款第 1 版」(OGDL v1，允许商用与再散布，需标示来源)。
 - 三大法人与融资融券 fetcher 已具备并发缓存防击穿和按 TWSE/TPEx 分流的熔断保护；TPEx OpenAPI 仅服务最新交易日，传入与服务日期不符的明确日期会 fail-open 返回无数据，避免错日资料静默进入报告。
 - 台股/美股通过 `YfinanceFetcher` 获取行情时以 `RealtimeSource.YFINANCE` 标识正常行情（不再误标为 `fallback`），并复用 `ticker.info` 的 `floatShares`/`sharesOutstanding` 计算换手率、回退使用 5 日量比 `volume_ratio_5d`，同时提取美股/海外机构持股与做空比率作为筹码参考；收市后日线已定稿时保留正式收盘 K 线，避免误判为盘中 `technical: partial`。
+- 台股 ETF 与双挂牌 ADR 增强：`SearchService.is_index_or_etf` / `is_leveraged_or_inverse_etf` 自动识别台股 `00xxxx.TW`/`.TWO` ETF 及杠杆/反向 ETF（如 `0050.TW`、`00631L.TW`、`00632R.TW`），分析 Prompt 跳过空置的企业财报与分红表并为杠杆/反向 ETF 附加波动耗损与期货基差警示；`data_provider/tw_adr_premium.py` 为双挂牌标的（`2330.TW↔TSM`、`2303.TW↔UMC`、`3711.TW↔ASX`、`2412.TW↔CHT`）自动计算 ADR 折溢价幅度并标注台美收盘时差与结构性溢价说明。
 - 台股财务金额会使用 TWD -> 「新台币」标注，避免落入 A 股语境下的默认「元」。
 
 不承诺项：

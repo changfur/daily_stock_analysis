@@ -970,6 +970,46 @@ def _format_tw_shares_to_lots(shares: Any, language: str = "zh") -> str:
     return f"{val:+,d} sh" if language == "en" else f"{val:+,d}股"
 
 
+def _format_tw_series_trend(
+    series: Any,
+    *,
+    days: int,
+    unit_shares: bool,
+    english: bool,
+    verb_up: str,
+    verb_down: str,
+) -> Optional[str]:
+    """Format a multi-day Taiwan flow series, distinguishing consecutive streaks from choppy/mixed flows."""
+    if not isinstance(series, dict) or days < 2:
+        return None
+    try:
+        cum = int(series.get("cumulative", 0))
+        pos = int(series.get("positive_days", 0))
+        neg = int(series.get("negative_days", 0))
+        streak = int(series.get("streak", 0))
+    except (TypeError, ValueError):
+        return None
+
+    lang_key = "en" if english else "zh"
+    if unit_shares:
+        cum_txt = _format_tw_shares_to_lots(cum, lang_key)
+    else:
+        cum_txt = f"{cum:+,d} lots" if english else f"{cum:+,d}张"
+
+    if english:
+        if streak >= 2:
+            return f"{streak}d consecutive {verb_up} ({days}d cum {cum_txt})"
+        if streak <= -2:
+            return f"{abs(streak)}d consecutive {verb_down} ({days}d cum {cum_txt})"
+        return f"{days}d mixed ({pos} {verb_up} / {neg} {verb_down}, cum {cum_txt}, no consecutive trend)"
+
+    if streak >= 2:
+        return f"连{verb_up} {streak} 日（近{days}日累计 {cum_txt}）"
+    if streak <= -2:
+        return f"连{verb_down} {abs(streak)} 日（近{days}日累计 {cum_txt}）"
+    return f"近{days}日{verb_up}{pos}{verb_down}{neg}（累计 {cum_txt}，无连续方向）"
+
+
 def build_offshore_chip_summary(
     context: Optional[Dict[str, Any]],
     language: str = "zh",
@@ -1009,6 +1049,20 @@ def build_offshore_chip_summary(
             parts.append(
                 f"三大法人合计 {tot_txt}（外资 {f_txt} / 投信 {t_txt} / 自营 {d_txt}）"
             )
+
+    inst_trend = context.get("tw_institutional_trend")
+    if isinstance(inst_trend, dict) and int(inst_trend.get("days") or 0) >= 2:
+        t_days = int(inst_trend["days"])
+        f_trend = _format_tw_series_trend(
+            inst_trend.get("foreign"),
+            days=t_days,
+            unit_shares=True,
+            english=english,
+            verb_up="buy" if english else "买",
+            verb_down="sell" if english else "卖",
+        )
+        if f_trend:
+            parts.append(f"Foreign {f_trend}" if english else f"外资{f_trend}")
 
     tw_margin = context.get("tw_margin_trading")
     if (
@@ -4999,7 +5053,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             if isinstance(earnings_data, dict)
             else {}
         )
-        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
+        if not context.get("is_index_etf") and (isinstance(financial_report, dict) or isinstance(dividend_metrics, dict)):
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
@@ -5129,6 +5183,49 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             )
         )
         if has_tw_institution:
+            inst_trend = context.get("tw_institutional_trend") if isinstance(context, dict) else None
+            inst_trend_rows = ""
+            if isinstance(inst_trend, dict) and int(inst_trend.get("days") or 0) >= 2:
+                t_days = int(inst_trend["days"])
+                f_tr = _format_tw_series_trend(
+                    inst_trend.get("foreign"),
+                    days=t_days,
+                    unit_shares=True,
+                    english=english,
+                    verb_up="buy" if english else "买",
+                    verb_down="sell" if english else "卖",
+                )
+                tr_tr = _format_tw_series_trend(
+                    inst_trend.get("trust"),
+                    days=t_days,
+                    unit_shares=True,
+                    english=english,
+                    verb_up="buy" if english else "买",
+                    verb_down="sell" if english else "卖",
+                )
+                tot_tr = _format_tw_series_trend(
+                    inst_trend.get("total"),
+                    days=t_days,
+                    unit_shares=True,
+                    english=english,
+                    verb_up="buy" if english else "买",
+                    verb_down="sell" if english else "卖",
+                )
+                if english:
+                    if f_tr:
+                        inst_trend_rows += f"| Foreign ({t_days}d Trend) | {f_tr} | Distinguish multi-day streak vs choppy mixed flow |\n"
+                    if tr_tr:
+                        inst_trend_rows += f"| Trust ({t_days}d Trend) | {tr_tr} | Multi-day trust persistence check |\n"
+                    if tot_tr:
+                        inst_trend_rows += f"| Total ({t_days}d Trend) | {tot_tr} | Multi-day aggregate institutional direction |\n"
+                else:
+                    if f_tr:
+                        inst_trend_rows += f"| 外资近{t_days}日趋势 | {f_tr} | 区分连续方向与震荡分歧，无连续方向时勿强行归类为趋势 |\n"
+                    if tr_tr:
+                        inst_trend_rows += f"| 投信近{t_days}日趋势 | {tr_tr} | 观察投信中线连续性 |\n"
+                    if tot_tr:
+                        inst_trend_rows += f"| 三大法人近{t_days}日趋势 | {tot_tr} | 多日合力方向参考 |\n"
+
             if english:
                 prompt += f"""
 ### Three Major Institutional Investors (Taiwan chip filter, net buy/sell, unit: shares)
@@ -5138,7 +5235,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | Investment Trusts | {institution_data.get('trust_net', 'N/A')} | Persistent trust buying often accompanies medium-term longs |
 | Dealers | {institution_data.get('dealer_net', 'N/A')} | Short-term hedging/proprietary direction reference |
 | Three Institutions Total | {institution_data.get('total_net', 'N/A')} | The most watched chip signal in Taiwan stocks |
-| Data Date | {institution_data.get('date', 'N/A')} | Source {institution_data.get('source', 'N/A')} |
+{inst_trend_rows}| Data Date | {institution_data.get('date', 'N/A')} | Source {institution_data.get('source', 'N/A')} |
 
 > The three major institutional investors are the chip filter for Taiwan stocks (similar in role to A-share main capital flow/Dragon Tiger list, but with a different definition that must not be mixed): foreign and investment-trust net buying in the same direction supports the price, net selling in the same direction suppresses it. Use this to judge the Taiwan chip structure; when this data is present, do not write "chip structure: data unavailable".
 """
@@ -5151,7 +5248,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 投信 | {institution_data.get('trust_net', 'N/A')} | 投信持续买超常伴随中线做多 |
 | 自营商 | {institution_data.get('dealer_net', 'N/A')} | 短线避险/自营方向参考 |
 | 三大法人合计 | {institution_data.get('total_net', 'N/A')} | 台股最受关注的筹码信号 |
-| 资料日期 | {institution_data.get('date', 'N/A')} | 来源 {institution_data.get('source', 'N/A')} |
+{inst_trend_rows}| 资料日期 | {institution_data.get('date', 'N/A')} | 来源 {institution_data.get('source', 'N/A')} |
 
 > 三大法人是台股的筹码过滤器（相当于 A 股主力资金/龙虎榜的角色，但口径不同、不可混用）：外资与投信同向净买支持价格、同向净卖压制价格。请据此判断台股筹码结构，不要在有本数据时写“筹码结构：数据缺失”。
 """
@@ -5174,6 +5271,38 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             offset_str = f"{int(offset_val):,d}" if offset_val is not None else "N/A"
             m_date = tw_margin.get("date_iso") or tw_margin.get("date") or "N/A"
             m_src = tw_margin.get("source") or "TWSE/TPEx"
+
+            margin_trend = context.get("tw_margin_trend") if isinstance(context, dict) else None
+            margin_trend_rows = ""
+            if isinstance(margin_trend, dict) and int(margin_trend.get("days") or 0) >= 2:
+                m_days = int(margin_trend["days"])
+                m_tr = _format_tw_series_trend(
+                    margin_trend.get("margin"),
+                    days=m_days,
+                    unit_shares=False,
+                    english=english,
+                    verb_up="rise" if english else "增",
+                    verb_down="drop" if english else "减",
+                )
+                s_tr = _format_tw_series_trend(
+                    margin_trend.get("short"),
+                    days=m_days,
+                    unit_shares=False,
+                    english=english,
+                    verb_up="rise" if english else "增",
+                    verb_down="drop" if english else "减",
+                )
+                if english:
+                    if m_tr:
+                        margin_trend_rows += f"| Margin ({m_days}d Trend) | {m_tr} | Multi-day retail leverage direction |\n"
+                    if s_tr:
+                        margin_trend_rows += f"| Short ({m_days}d Trend) | {s_tr} | Multi-day short positioning direction |\n"
+                else:
+                    if m_tr:
+                        margin_trend_rows += f"| 融资近{m_days}日趋势 | {m_tr} | 观察散户杠杆是否连续扩增或退潮 |\n"
+                    if s_tr:
+                        margin_trend_rows += f"| 融券近{m_days}日趋势 | {s_tr} | 观察空方押注持续性 |\n"
+
             if english:
                 prompt += f"""
 ### Margin & Short Trading (Taiwan credit trading, unit: lots)
@@ -5183,7 +5312,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | Short Balance (Change) | {s_bal:,d} ({s_chg:+,d}) | Rising short balance can reflect hedging or potential short-squeeze fuel |
 | Short-to-Margin Ratio | {ratio_str} | Elevated ratio indicates heavier short positioning |
 | Intraday Offset | {offset_str} | Margin-short intraday offsetting lots |
-| Data Date | {m_date} | Source {m_src} |
+{margin_trend_rows}| Data Date | {m_date} | Source {m_src} |
 """
             else:
                 prompt += f"""
@@ -5194,7 +5323,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 融券余额（日增减） | {s_bal:,d} 张（{s_chg:+,d} 张） | 融券增加代表空方押注或避险，高券资比时须留意轧空 |
 | 券资比 | {ratio_str} | 融券/融资比例，衡量空方筹码拥挤度 |
 | 资券互抵 | {offset_str} 张 | 当日信用当冲互抵张数 |
-| 资料日期 | {m_date} | 来源 {m_src} |
+{margin_trend_rows}| 资料日期 | {m_date} | 来源 {m_src} |
 """
 
         # 添加美股/海外机构持股与做空筹码（来自 yfinance ticker.info，无额外请求）
@@ -5318,6 +5447,68 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 ### {chip_section_title}
 > {chip_unavailable_text}
 > {chip_instruction}
+"""
+
+        # 添加台股 ADR 折溢价参考（如 2330.TW <-> TSM）
+        adr_premium = context.get("adr_premium") if isinstance(context, dict) else None
+        if (
+            isinstance(adr_premium, dict)
+            and adr_premium.get("adr_twd_equiv") is not None
+            and adr_premium.get("premium_pct") is not None
+        ):
+            adr_sym = adr_premium.get("adr_symbol", "ADR")
+            tw_sym = adr_premium.get("tw_code", "TW")
+            ratio = int(adr_premium.get("ratio") or 1)
+            adr_px = float(adr_premium.get("adr_price_usd") or 0)
+            tw_px = float(adr_premium.get("tw_price_twd") or 0)
+            usd_twd = float(adr_premium.get("usd_twd") or 0)
+            adr_twd = float(adr_premium["adr_twd_equiv"])
+            prem_pct = float(adr_premium["premium_pct"])
+            adr_dt = adr_premium.get("adr_date") or "N/A"
+            tw_dt = adr_premium.get("tw_date") or "N/A"
+            fx_dt = adr_premium.get("fx_date") or "N/A"
+            structural = bool(adr_premium.get("structural_premium"))
+            if english:
+                prem_label = "ADR premium" if prem_pct >= 0 else "ADR discount"
+                structural_note = (
+                    f" Note: {adr_sym} structurally trades at a persistent positive premium to {tw_sym} due to US liquidity and conversion constraints; "
+                    "focus on unusual widening or narrowing rather than treating a positive premium as automatic overvaluation."
+                    if structural
+                    else ""
+                )
+                prompt += f"""
+### ADR Premium/Discount Reference ({tw_sym} vs {adr_sym})
+| Metric | Value | Note |
+|------|------|------|
+| Conversion Pair | 1 {adr_sym} ADR = {ratio} shares of {tw_sym} | Dual-listed parity ratio |
+| US ADR Close ({adr_sym}) | ${adr_px:.2f} | Date: {adr_dt} |
+| TW Close ({tw_sym}) | NT${tw_px:,.2f} | Date: {tw_dt} |
+| USD/TWD FX Rate | {usd_twd:.4f} | Date: {fx_dt} |
+| Implied ADR TWD Equiv. | NT${adr_twd:,.2f} | Formula: ADR_USD * USD_TWD / {ratio} |
+| **Implied Premium/Discount** | **{prem_pct:+.2f}% ({prem_label})** | Mind the 12-13h close-time gap between TW and US markets |
+
+> Cross-market reference only: always check both closing dates above when comparing TW vs US moves.{structural_note}
+"""
+            else:
+                prem_label = "ADR 溢价" if prem_pct >= 0 else "ADR 折价"
+                structural_note = (
+                    f"特别提示：{adr_sym} 相对 {tw_sym} 受美股流动性与转换额度影响长期存在结构性正溢价，"
+                    "应关注溢价是否异常扩大或收敛，切勿仅因正溢价就机械判定高估。"
+                    if structural
+                    else ""
+                )
+                prompt += f"""
+### ADR 折溢价参考（{tw_sym} vs {adr_sym}）
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 换算比例 | 1 股 {adr_sym} ADR = {ratio} 股 {tw_sym} | 台美两地挂牌换股比例 |
+| 美股 ADR 收盘价（{adr_sym}） | ${adr_px:.2f} | 资料日期：{adr_dt} |
+| 台股普通股收盘价（{tw_sym}） | NT${tw_px:,.2f} | 资料日期：{tw_dt} |
+| 美元/台币汇率 (USD/TWD) | {usd_twd:.4f} | 资料日期：{fx_dt} |
+| ADR 折合台股等值价 | NT${adr_twd:,.2f} | 公式：ADR 价格 × 汇率 ÷ {ratio} |
+| **隐含折溢价幅度** | **{prem_pct:+.2f}%（{prem_label}）** | 须留意台美收盘存在 12–13 小时时差 |
+
+> 跨市场联动参考：对比台美表现时请核对上方两边收盘日期。{structural_note}
 """
         
         # 添加趋势分析结果（仅隐式内建 bull_trend 默认回退保留旧口径）
@@ -5566,6 +5757,15 @@ Generate the Decision Dashboard for **{stock_name}({code})**, output strictly in
 
 请为 **{stock_name}({code})** 生成【决策仪表盘】，严格按照 JSON 格式输出。
 """
+        is_leveraged_etf = bool(context.get('is_leveraged_etf'))
+        if not is_leveraged_etf and context.get('is_index_etf'):
+            try:
+                from src.search_service import SearchService
+
+                is_leveraged_etf = SearchService.is_leveraged_or_inverse_etf(code, stock_name)
+            except Exception:
+                is_leveraged_etf = False
+
         if context.get('is_index_etf') and english:
             prompt += """
 > ⚠️ **Index/ETF analysis constraints**: this instrument is an index-tracking ETF or a market index.
@@ -5573,8 +5773,13 @@ Generate the Decision Dashboard for **{stock_name}({code})**, output strictly in
 > - Never include lawsuits, reputation or executive changes of the fund company in risk alerts
 > - Earnings expectations are based on **the overall performance of the index constituents**, not the fund company's financials
 > - `risk_alerts` must not contain operating risks of the fund manager
-
 """
+            if is_leveraged_etf:
+                prompt += """
+> - **Leveraged/Inverse ETF risk warning**: this instrument resets leverage daily (often via futures/swaps), creating **volatility drag (compounding decay) and futures roll/basis risk** that erode NAV in choppy sideways markets
+> - Frame advice around **tactical/trend swing positioning** with strict stop-loss and position sizing rather than passive long-term buy-and-hold
+"""
+            prompt += "\n"
         elif context.get('is_index_etf'):
             prompt += """
 > ⚠️ **指数/ETF 分析约束**：该标的为指数跟踪型 ETF 或市场指数。
@@ -5582,8 +5787,13 @@ Generate the Decision Dashboard for **{stock_name}({code})**, output strictly in
 > - 严禁将基金公司的诉讼、声誉、高管变动纳入风险警报
 > - 业绩预期基于**指数成分股整体表现**，而非基金公司财报
 > - `risk_alerts` 中不得出现基金管理人相关的公司经营风险
-
 """
+            if is_leveraged_etf:
+                prompt += """
+> - **杠杆/反向 ETF 特别警示**：本标的为杠杆或反向型 ETF（通常通过期货/掉期每日再平衡），存在**波动耗损（Volatility Drag）与期货换仓/基差风险**，震荡市长期持有净值会自然衰减
+> - 操作建议须以**波段/顺势交易**为主，强调严格止损与仓位控制，避免建议盲目长线死抱
+"""
+            prompt += "\n"
         if english:
             prompt += f"""
 ### ⚠️ Important: output the correct stock name format

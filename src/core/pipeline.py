@@ -761,6 +761,8 @@ class StockAnalysisPipeline:
                     logger.warning(f"{log_stock_name}({code}) failed to fetch chip distribution: {e}")
 
             tw_margin_trading = None
+            tw_institutional_trend = None
+            tw_margin_trend = None
             if not is_index and get_market_for_stock(normalize_stock_code(code)) == "tw":
                 try:
                     tw_fetcher = getattr(self.fetcher_manager, "_tw_institutional_fetcher", None)
@@ -781,8 +783,46 @@ class StockAnalysisPipeline:
                             tw_margin_trading.get("short_change", 0),
                             tw_margin_trading.get("date", "unknown"),
                         )
+                    tw_institutional_trend = tw_fetcher.get_institutional_trend(code, days=5)
+                    tw_margin_trend = tw_fetcher.get_margin_trend(code, days=5)
                 except Exception as e:
                     logger.warning("[tw-margin] %s(%s) fetch failed: %s", log_stock_name, code, e)
+
+            adr_premium = None
+            if not is_index:
+                try:
+                    from data_provider.tw_adr_premium import TwAdrPremiumFetcher, get_adr_pair_for_code
+
+                    if get_adr_pair_for_code(code) is not None:
+                        adr_fetcher = getattr(self.fetcher_manager, "_tw_adr_fetcher", None)
+                        if adr_fetcher is None:
+                            adr_fetcher = TwAdrPremiumFetcher()
+                            self.fetcher_manager._tw_adr_fetcher = adr_fetcher
+                        local_price = getattr(realtime_quote, "price", None) if realtime_quote else None
+                        local_date = None
+                        if realtime_quote and getattr(realtime_quote, "quote_time", None):
+                            local_date = str(realtime_quote.quote_time)[:10]
+                        adr_premium = adr_fetcher.get_adr_premium(
+                            code,
+                            local_price=local_price,
+                            local_date=local_date,
+                        )
+                        if adr_premium:
+                            logger.info(
+                                "[tw-adr] %s(%s) %s=%.2f USD (%s) vs %s=%.2f TWD (%s) fx=%.4f premium=%+.2f%%",
+                                log_stock_name,
+                                code,
+                                adr_premium["adr_symbol"],
+                                adr_premium["adr_price_usd"],
+                                adr_premium["adr_date"],
+                                adr_premium["tw_code"],
+                                adr_premium["tw_price_twd"],
+                                adr_premium["tw_date"],
+                                adr_premium["usd_twd"],
+                                adr_premium["premium_pct"],
+                            )
+                except Exception as e:
+                    logger.warning("[tw-adr] %s(%s) premium calculation failed: %s", log_stock_name, code, e)
 
             # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
             # NOTE: use config.agent_mode (explicit opt-in) instead of
@@ -1038,6 +1078,9 @@ class StockAnalysisPipeline:
                 market_phase_context=market_phase_context_dict,
                 portfolio_context=portfolio_context,
                 tw_margin_trading=tw_margin_trading,
+                tw_institutional_trend=tw_institutional_trend,
+                tw_margin_trend=tw_margin_trend,
+                adr_premium=adr_premium,
             )
             enhanced_context["market_phase_context"] = market_phase_context_dict
             self._attach_daily_market_context(
@@ -1298,6 +1341,9 @@ class StockAnalysisPipeline:
         market_phase_context: Optional[Dict[str, Any]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
         tw_margin_trading: Optional[Dict[str, Any]] = None,
+        tw_institutional_trend: Optional[Dict[str, Any]] = None,
+        tw_margin_trend: Optional[Dict[str, Any]] = None,
+        adr_premium: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         增强分析上下文
@@ -1327,6 +1373,12 @@ class StockAnalysisPipeline:
             enhanced["portfolio_context"] = dict(portfolio_context)
         if isinstance(tw_margin_trading, dict) and tw_margin_trading:
             enhanced["tw_margin_trading"] = dict(tw_margin_trading)
+        if isinstance(tw_institutional_trend, dict) and tw_institutional_trend:
+            enhanced["tw_institutional_trend"] = dict(tw_institutional_trend)
+        if isinstance(tw_margin_trend, dict) and tw_margin_trend:
+            enhanced["tw_margin_trend"] = dict(tw_margin_trend)
+        if isinstance(adr_premium, dict) and adr_premium:
+            enhanced["adr_premium"] = dict(adr_premium)
 
         # 将运行时搜索窗口透传给 analyzer，避免与全局配置重新读取产生窗口不一致
         enhanced['news_window_days'] = getattr(self.search_service, "news_window_days", 3)
@@ -1548,6 +1600,9 @@ class StockAnalysisPipeline:
 
         # ETF/index flag for analyzer prompt (Fixes #274)
         enhanced['is_index_etf'] = SearchService.is_index_or_etf(
+            context.get('code', ''), enhanced.get('stock_name', stock_name)
+        )
+        enhanced['is_leveraged_etf'] = SearchService.is_leveraged_or_inverse_etf(
             context.get('code', ''), enhanced.get('stock_name', stock_name)
         )
 
